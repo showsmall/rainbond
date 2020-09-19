@@ -19,21 +19,26 @@
 package callback
 
 import (
-	"github.com/Sirupsen/logrus"
+	"time"
+
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/discover"
 	"github.com/goodrain/rainbond/discover/config"
 	"github.com/goodrain/rainbond/monitor/prometheus"
 	"github.com/goodrain/rainbond/monitor/utils"
 	"github.com/prometheus/common/model"
-	"time"
 )
 
+//Etcd etcd discover
 type Etcd struct {
 	discover.Callback
 	Prometheus      *prometheus.Manager
+	Scheme          string
+	TLSConfig       prometheus.TLSConfig
 	sortedEndpoints []string
 }
 
+//UpdateEndpoints update endpoints
 func (e *Etcd) UpdateEndpoints(endpoints ...*config.Endpoint) {
 	newArr := utils.TrimAndSort(endpoints)
 
@@ -52,6 +57,7 @@ func (e *Etcd) Error(err error) {
 	logrus.Error(err)
 }
 
+//Name name
 func (e *Etcd) Name() string {
 	return "etcd"
 }
@@ -62,8 +68,9 @@ func (e *Etcd) toScrape() *prometheus.ScrapeConfig {
 		ts = append(ts, end)
 	}
 
-	return &prometheus.ScrapeConfig{
+	sc := &prometheus.ScrapeConfig{
 		JobName:        e.Name(),
+		Scheme:         e.Scheme,
 		ScrapeInterval: model.Duration(1 * time.Minute),
 		ScrapeTimeout:  model.Duration(30 * time.Second),
 		MetricsPath:    "/metrics",
@@ -78,4 +85,10 @@ func (e *Etcd) toScrape() *prometheus.ScrapeConfig {
 			},
 		},
 	}
+	if e.Scheme == "https" {
+		sc.HTTPClientConfig = prometheus.HTTPClientConfig{
+			TLSConfig: e.TLSConfig,
+		}
+	}
+	return sc
 }

@@ -19,17 +19,16 @@
 package handler
 
 import (
-	"github.com/goodrain/rainbond/cmd/api/option"
-	api_db "github.com/goodrain/rainbond/api/db"
-	api_model "github.com/goodrain/rainbond/api/model"
-	"github.com/goodrain/rainbond/db"
 	"fmt"
 	"os/exec"
 	"testing"
 	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/pquerna/ffjson/ffjson"
+	api_db "github.com/goodrain/rainbond/api/db"
+	api_model "github.com/goodrain/rainbond/api/model"
+	"github.com/goodrain/rainbond/cmd/api/option"
+
+	"github.com/sirupsen/logrus"
 )
 
 func TestEmessage(t *testing.T) {
@@ -47,26 +46,26 @@ func TestEmessage(t *testing.T) {
 }
 
 func getLevelLog(eventID string, level string) (*api_model.DataLog, error) {
-	messages, err := db.GetManager().EventLogDao().GetEventLogMessages(eventID)
-	if err != nil {
-		return nil, err
-	}
-	//var d []api_model.MessageData
-	for _, v := range messages {
-		log, err := uncompress(v.Message)
-		if err != nil {
-			return nil, err
-		}
-		logrus.Debugf("log is %v", log)
-		fmt.Printf("log is %v", string(log))
-
-		var mLogs []msgStruct
-		if err := ffjson.Unmarshal(log, &mLogs); err != nil {
-			return nil, err
-		}
-		fmt.Printf("jlog %v", mLogs)
-		break
-	}
+	//messages, err := db.GetManager().EventLogDao().GetEventLogMessages(eventID)
+	//if err != nil {
+	//	return nil, err
+	//}
+	////var d []api_model.MessageData
+	//for _, v := range messages {
+	//	log, err := uncompress(v.Message)
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//	logrus.Debugf("log is %v", log)
+	//	fmt.Printf("log is %v", string(log))
+	//
+	//	var mLogs []msgStruct
+	//	if err := ffjson.Unmarshal(log, &mLogs); err != nil {
+	//		return nil, err
+	//	}
+	//	fmt.Printf("jlog %v", mLogs)
+	//	break
+	//}
 	return nil, nil
 }
 

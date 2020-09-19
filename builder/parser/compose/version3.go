@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	libcomposeyaml "github.com/docker/libcompose/yaml"
 	"github.com/twinj/uuid"
 
@@ -308,7 +308,7 @@ func dockerComposeToKomposeMapping(composeObject *types.Config) (ComposeObject, 
 		}
 
 		if serviceConfig.ExposeService == "" && serviceConfig.ExposeServiceTLS != "" {
-			return ComposeObject{}, fmt.Errorf("kompose.service.expose.tls-secret was specifed without kompose.service.expose")
+			return ComposeObject{}, fmt.Errorf("kompose.service.expose.tls-secret was specified without kompose.service.expose")
 		}
 
 		// Log if the name will been changed

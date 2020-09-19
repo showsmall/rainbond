@@ -19,17 +19,30 @@
 package main
 
 import (
-	"github.com/Sirupsen/logrus"
-	"github.com/goodrain/rainbond/cmd/monitor/option"
-	"github.com/goodrain/rainbond/monitor"
-	"github.com/goodrain/rainbond/monitor/prometheus"
-	"github.com/spf13/pflag"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
+
+	"github.com/goodrain/rainbond/cmd"
+
+	"github.com/goodrain/rainbond/monitor/custom"
+
+	"github.com/goodrain/rainbond/cmd/monitor/option"
+	"github.com/goodrain/rainbond/monitor"
+	"github.com/goodrain/rainbond/monitor/api"
+	"github.com/goodrain/rainbond/monitor/api/controller"
+	"github.com/goodrain/rainbond/monitor/prometheus"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		cmd.ShowVersion("monitor")
+	}
 	c := option.NewConfig()
 	c.AddFlag(pflag.CommandLine)
 	c.AddPrometheusFlag(pflag.CommandLine)
@@ -38,7 +51,13 @@ func main() {
 	c.CompleteConfig()
 
 	// start prometheus daemon and watching tis status in all time, exit monitor process if start failed
-	p := prometheus.NewManager(c)
+	a := prometheus.NewRulesManager(c)
+	p := prometheus.NewManager(c, a)
+	controllerManager := controller.NewControllerManager(a, p)
+
+	monitorMysql(c, p)
+	monitorKSM(c, p)
+
 	errChan := make(chan error, 1)
 	defer close(errChan)
 	p.StartDaemon(errChan)
@@ -52,6 +71,10 @@ func main() {
 	m := monitor.NewMonitor(c, p)
 	m.Start()
 	defer m.Stop()
+
+	r := api.Server(controllerManager)
+	logrus.Info("monitor api listen port 3329")
+	go http.ListenAndServe(":3329", r)
 
 	//step finally: listen Signal
 	term := make(chan os.Signal)
@@ -67,4 +90,30 @@ func main() {
 		}
 	}
 	logrus.Info("See you next time!")
+}
+
+func monitorMysql(c *option.Config, p *prometheus.Manager) {
+	if strings.TrimSpace(c.MysqldExporter) != "" {
+		metrics := strings.TrimSpace(c.MysqldExporter)
+		logrus.Infof("add mysql metrics[%s] into prometheus", metrics)
+		custom.AddMetrics(p, custom.Metrics{Name: "mysql", Path: "/metrics", Metrics: []string{metrics}, Interval: 30 * time.Second, Timeout: 15 * time.Second})
+	}
+}
+
+func monitorKSM(c *option.Config, p *prometheus.Manager) {
+	if strings.TrimSpace(c.KSMExporter) != "" {
+		metrics := strings.TrimSpace(c.KSMExporter)
+		logrus.Infof("add kube-state-metrics[%s] into prometheus", metrics)
+		custom.AddMetrics(p, custom.Metrics{
+			Name: "kubernetes",
+			Path: "/metrics",
+			Scheme: func() string {
+				if strings.HasSuffix(metrics, "443") {
+					return "https"
+				}
+				return "http"
+			}(),
+			Metrics: []string{metrics}, Interval: 30 * time.Second, Timeout: 10 * time.Second},
+		)
+	}
 }

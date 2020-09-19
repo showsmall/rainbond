@@ -19,38 +19,44 @@
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 
+	"github.com/go-chi/chi"
+	"github.com/goodrain/rainbond/api/handler"
 	"github.com/goodrain/rainbond/api/middleware"
 	api_model "github.com/goodrain/rainbond/api/model"
+	"github.com/goodrain/rainbond/cmd"
+	"github.com/goodrain/rainbond/db"
+	"github.com/goodrain/rainbond/db/errors"
 	dbmodel "github.com/goodrain/rainbond/db/model"
-
-	"github.com/pquerna/ffjson/ffjson"
-
-	"github.com/go-chi/chi"
-	"github.com/jinzhu/gorm"
-	validator "github.com/thedevsaddam/govalidator"
-
-	"github.com/goodrain/rainbond/api/handler"
-	"github.com/goodrain/rainbond/appruntimesync/client"
+	mqclient "github.com/goodrain/rainbond/mq/client"
+	validation "github.com/goodrain/rainbond/util/endpoint"
+	"github.com/goodrain/rainbond/util/fuzzy"
 	httputil "github.com/goodrain/rainbond/util/http"
-
-	"github.com/Sirupsen/logrus"
-	"github.com/renstorm/fuzzysearch/fuzzy"
+	"github.com/goodrain/rainbond/worker/client"
+	"github.com/jinzhu/gorm"
+	"github.com/sirupsen/logrus"
+	validator "github.com/goodrain/rainbond/util/govalidator"
 )
 
 //V2Routes v2Routes
 type V2Routes struct {
+	ClusterController
 	TenantStruct
-	AcpNodeStruct
-	EntranceStruct
 	EventLogStruct
 	AppStruct
+	GatewayStruct
+	ThirdPartyServiceController
+	LabelController
+	AppRestoreController
+	PodController
 }
 
 //Show test
@@ -70,17 +76,43 @@ func (v2 *V2Routes) Show(w http.ResponseWriter, r *http.Request) {
 	//     schema:
 	//       "$ref": "#/responses/commandResponse"
 	//     description: 统一返回格式
-	w.Write([]byte("v2 urls"))
+	w.Write([]byte(cmd.GetVersion()))
+}
+
+//Health show health status
+func (v2 *V2Routes) Health(w http.ResponseWriter, r *http.Request) {
+	httputil.ReturnSuccess(r, w, map[string]string{"status": "health", "info": "api service health"})
+}
+
+//AlertManagerWebHook -
+func (v2 *V2Routes) AlertManagerWebHook(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("=======>webhook")
+	in, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		fmt.Println(err)
+		httputil.ReturnError(r, w, 400, "")
+		return
+	}
+	fmt.Println("=====>body")
+	fmt.Println(string(in))
+	httputil.ReturnSuccess(r, w, "")
+
+}
+
+//Version -
+func (v2 *V2Routes) Version(w http.ResponseWriter, r *http.Request) {
+	httputil.ReturnSuccess(r, w, map[string]string{"version": os.Getenv("RELEASE_DESC")})
 }
 
 //TenantStruct tenant struct
 type TenantStruct struct {
 	StatusCli *client.AppRuntimeSyncClient
+	MQClient  mqclient.MQClient
 }
 
 //AllTenantResources GetResources
 func (t *TenantStruct) AllTenantResources(w http.ResponseWriter, r *http.Request) {
-	tenants, err := handler.GetTenantManager().GetTenants()
+	tenants, err := handler.GetTenantManager().GetTenants("")
 	if err != nil {
 		msg := httputil.ResponseBody{
 			Msg: fmt.Sprintf("get tenant error, %v", err),
@@ -126,6 +158,7 @@ func (t *TenantStruct) TenantResources(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
 	rep, err := handler.GetTenantManager().GetTenantsResources(&tr)
 	if err != nil {
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("get resources error, %v", err))
@@ -349,8 +382,20 @@ func (t *TenantStruct) SumTenants(w http.ResponseWriter, r *http.Request) {
 	httputil.ReturnSuccess(r, w, rc)
 }
 
-//Tenant Tenant
+//Tenant one tenant controller
 func (t *TenantStruct) Tenant(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		t.GetTenant(w, r)
+	case "DELETE":
+		t.DeleteTenant(w, r)
+	case "PUT":
+		t.UpdateTenant(w, r)
+	}
+}
+
+//Tenants Tenant
+func (t *TenantStruct) Tenants(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST":
 		t.AddTenant(w, r)
@@ -408,6 +453,7 @@ func (t *TenantStruct) AddTenant(w http.ResponseWriter, r *http.Request) {
 			dbts.UUID = ts.Body.TenantID
 			id = ts.Body.TenantID
 		}
+		dbts.LimitMemory = ts.Body.LimitMemory
 		if err := handler.GetServiceManager().CreateTenant(&dbts); err != nil {
 			if strings.HasSuffix(err.Error(), "is exist") {
 				httputil.ReturnError(r, w, 400, err.Error())
@@ -469,54 +515,97 @@ func (t *TenantStruct) GetTenants(w http.ResponseWriter, r *http.Request) {
 	//       "$ref": "#/responses/commandResponse"
 	//     description: 统一返回格式
 	value := r.FormValue("eid")
-	id := len(value)
-	if id == 0 {
-		tenants, err := handler.GetTenantManager().GetTenants()
+	page, _ := strconv.Atoi(r.FormValue("page"))
+	if page == 0 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(r.FormValue("pageSize"))
+	if pageSize == 0 {
+		pageSize = 10
+	}
+	queryName := r.FormValue("query")
+	var tenants []*dbmodel.Tenants
+	var err error
+	if len(value) == 0 {
+		tenants, err = handler.GetTenantManager().GetTenants(queryName)
 		if err != nil {
 			httputil.ReturnError(r, w, 500, "get tenant error")
 			return
 		}
-		httputil.ReturnSuccess(r, w, tenants)
-		return
+	} else {
+		tenants, err = handler.GetTenantManager().GetTenantsByEid(value, queryName)
+		if err != nil {
+			httputil.ReturnError(r, w, 500, "get tenant error")
+			return
+		}
 	}
-
-	tenants, err := handler.GetTenantManager().GetTenantsByEid(value)
-	if err != nil {
-		httputil.ReturnError(r, w, 500, "get tenant error")
-		return
-	}
-	httputil.ReturnSuccess(r, w, tenants)
+	list := handler.GetTenantManager().BindTenantsResource(tenants)
+	re := list.Paging(page, pageSize)
+	httputil.ReturnSuccess(r, w, re)
 }
 
 //DeleteTenant DeleteTenant
 func (t *TenantStruct) DeleteTenant(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("delete tenant"))
+	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)
+
+	if err := handler.GetTenantManager().DeleteTenant(tenantID); err != nil {
+		if err == handler.ErrTenantStillHasServices || err == handler.ErrTenantStillHasPlugins {
+			httputil.ReturnError(r, w, 400, err.Error())
+			return
+		}
+		if err == gorm.ErrRecordNotFound {
+			httputil.ReturnError(r, w, 404, err.Error())
+			return
+		}
+
+		httputil.ReturnError(r, w, 500, fmt.Sprintf("delete tenant: %v", err))
+		return
+	}
+
+	httputil.ReturnSuccess(r, w, nil)
 }
 
 //UpdateTenant UpdateTenant
+//support update tenant limit memory
 func (t *TenantStruct) UpdateTenant(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("update tenant"))
+	var ts api_model.UpdateTenantStruct
+	ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &ts.Body, nil)
+	if !ok {
+		return
+	}
+	tenant := r.Context().Value(middleware.ContextKey("tenant")).(*dbmodel.Tenants)
+	tenant.LimitMemory = ts.Body.LimitMemory
+	if err := handler.GetTenantManager().UpdateTenant(tenant); err != nil {
+		httputil.ReturnError(r, w, 500, "update tenant error")
+		return
+	}
+	httputil.ReturnSuccess(r, w, tenant)
 }
 
-//Get all apps and status
+//GetTenant get one tenant
+func (t *TenantStruct) GetTenant(w http.ResponseWriter, r *http.Request) {
+	tenant := r.Context().Value(middleware.ContextKey("tenant")).(*dbmodel.Tenants)
+	list := handler.GetTenantManager().BindTenantsResource([]*dbmodel.Tenants{tenant})
+	httputil.ReturnSuccess(r, w, list[0])
+}
+
+//ServicesCount Get all apps and status
 func (t *TenantStruct) ServicesCount(w http.ResponseWriter, r *http.Request) {
 	allStatus := t.StatusCli.GetAllStatus()
-	var closed int = 0
-	var running int = 0
-	var abnormal int = 0
+	var closed int
+	var running int
+	var abnormal int
 	for _, v := range allStatus {
 		switch v {
 		case "closed":
-			closed += 1
+			closed++
 		case "running":
-			running += 1
+			running++
 		case "abnormal":
-			abnormal += 1
-
+			abnormal++
 		}
-
 	}
-	serviceCount := map[string]int{"total":len(allStatus),"running":running,"closed":closed,"abnormal":abnormal}
+	serviceCount := map[string]int{"total": len(allStatus), "running": running, "closed": closed, "abnormal": abnormal}
 	httputil.ReturnSuccess(r, w, serviceCount)
 }
 
@@ -554,48 +643,35 @@ func (t *TenantStruct) ServicesInfo(w http.ResponseWriter, r *http.Request) {
 
 //CreateService create Service
 func (t *TenantStruct) CreateService(w http.ResponseWriter, r *http.Request) {
-	// swagger:operation POST /v2/tenants/{tenant_name}/services v2 createService
-	//
-	// 创建应用
-	//
-	// create service
-	//
-	// ---
-	// consumes:
-	// - application/json
-	// - application/x-protobuf
-	//
-	// produces:
-	// - application/json
-	// - application/xml
-	//
-	// responses:
-	//   default:
-	//     schema:
-	//       "$ref": "#/responses/commandResponse"
-	//     description: 统一返回格式
-
-	logrus.Debugf("trans create service service")
 	var ss api_model.ServiceStruct
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		httputil.ReturnError(r, w, 500, err.Error())
+	if !httputil.ValidatorRequestStructAndErrorResponse(r, w, &ss, nil) {
 		return
 	}
-	err = ffjson.Unmarshal(body, &ss)
-	if err != nil {
-		httputil.ReturnError(r, w, 500, err.Error())
+
+	// clean etcd data(source check)
+	handler.GetEtcdHandler().CleanServiceCheckData(ss.EtcdKey)
+
+	values := url.Values{}
+	if ss.Endpoints != nil && strings.TrimSpace(ss.Endpoints.Static) != "" {
+		if strings.Contains(ss.Endpoints.Static, "127.0.0.1") {
+			values["ip"] = []string{"The ip field is can't contains '127.0.0.1'"}
+		}
+	}
+	if len(values) > 0 {
+		httputil.ReturnValidationError(r, w, values)
 		return
 	}
-	logrus.Debugf("data is %v", ss)
 
 	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)
 	ss.TenantID = tenantID
-	logrus.Debugf("begin to create service")
 	if err := handler.GetServiceManager().ServiceCreate(&ss); err != nil {
+		if strings.Contains(err.Error(), "is exist in tenant") {
+			httputil.ReturnError(r, w, 400, fmt.Sprintf("create service error, %v", err))
+		}
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("create service error, %v", err))
 		return
 	}
+
 	httputil.ReturnSuccess(r, w, nil)
 }
 
@@ -621,16 +697,15 @@ func (t *TenantStruct) UpdateService(w http.ResponseWriter, r *http.Request) {
 	//     schema:
 	//       "$ref": "#/responses/commandResponse"
 	//     description: 统一返回格式
-
 	logrus.Debugf("trans update service service")
 	//目前提供三个元素的修改
 	rules := validator.MapData{
 		"container_cmd":    []string{},
 		"image_name":       []string{},
 		"container_memory": []string{},
+		"service_name":     []string{},
+		"extend_method":    []string{},
 	}
-	//对应前方三个元素
-	//mm := []string{"image_name", "container_cmd", "container_memory"}
 	data, ok := httputil.ValidatorRequestMapAndErrorResponse(r, w, rules, nil)
 	if !ok {
 		return
@@ -753,184 +828,75 @@ func (t *TenantStruct) StatusServiceList(w http.ResponseWriter, r *http.Request)
 	//logrus.Info(services.Body.ServiceIDs)
 	serviceList := services.Body.ServiceIDs
 	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)
-	statusList := handler.GetServiceManager().GetServicesStatus(tenantID, serviceList)
-	var info = make([]map[string]string, 0)
-	if statusList != nil {
-		for k, v := range statusList {
-			info = append(info, map[string]string{"service_id": k, "status": v, "status_cn": TransStatus(v)})
-		}
-	}
+	info := handler.GetServiceManager().GetServicesStatus(tenantID, serviceList)
+
 	httputil.ReturnSuccess(r, w, info)
 }
 
-//ServiceLabel label
-func (t *TenantStruct) ServiceLabel(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "PUT":
-		t.UpdateServiceLabel(w, r)
-	case "POST":
-		t.AddServiceLabel(w, r)
-	}
-}
-
-//AddServiceLabel AddServiceLabel
-func (t *TenantStruct) AddServiceLabel(w http.ResponseWriter, r *http.Request) {
-	// swagger:operation POST  /v2/tenants/{tenant_name}/services/{service_alias}/service-label v2 addServiceLabel
-	//
-	// 添加应用标签
-	//
-	// add service label
-	//
-	// ---
-	// consumes:
-	// - application/json
-	// - application/x-protobuf
-	//
-	// produces:
-	// - application/json
-	// - application/xml
-	//
-	// responses:
-	//   default:
-	//     schema:
-	//       "$ref": "#/responses/commandResponse"
-	//     description: 统一返回格式
-	rules := validator.MapData{
-		"label_values": []string{"required"},
-	}
-	data, ok := httputil.ValidatorRequestMapAndErrorResponse(r, w, rules, nil)
+//Label -
+func (t *TenantStruct) Label(w http.ResponseWriter, r *http.Request) {
+	var req api_model.LabelsStruct
+	ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &req, nil)
 	if !ok {
 		return
 	}
-	var valueList []string
-	valueList = append(valueList, data["label_values"].(string))
-	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
-	if err := handler.GetServiceManager().AddLabel("service", serviceID, valueList); err != nil {
-		httputil.ReturnError(r, w, 500, fmt.Sprintf("add service label error, %v", err))
-		return
-	}
-	httputil.ReturnSuccess(r, w, nil)
-}
+	reqJSON, _ := json.Marshal(req)
+	logrus.Debugf("Request is : %s", string(reqJSON))
 
-//UpdateServiceLabel UpdateServiceLabel
-func (t *TenantStruct) UpdateServiceLabel(w http.ResponseWriter, r *http.Request) {
-	// swagger:operation PUT /v2/tenants/{tenant_name}/services/{service_alias}/service-label v2 updateServiceLabel
-	//
-	// 更新应用标签
-	//
-	// delete service label
-	//
-	// ---
-	// consumes:
-	// - application/json
-	// - application/x-protobuf
-	//
-	// produces:
-	// - application/json
-	// - application/xml
-	//
-	// responses:
-	//   default:
-	//     schema:
-	//       "$ref": "#/responses/commandResponse"
-	//     description: 统一返回格式
-	rules := validator.MapData{
-		"label_values": []string{"required"},
+	// verify request
+	values := url.Values{}
+	if req.Labels == nil || len(req.Labels) == 0 {
+		values["labels"] = []string{"The labels field should have someting"}
 	}
-	data, ok := httputil.ValidatorRequestMapAndErrorResponse(r, w, rules, nil)
-	if !ok {
+	for _, label := range req.Labels {
+		if label.LabelKey == "" {
+			values["label_key"] = []string{"The label_key field is required"}
+		}
+		if label.LabelValue == "" {
+			values["label_value"] = []string{"The label_value field is required"}
+		}
+	}
+	if len(values) != 0 {
+		httputil.ReturnValidationError(r, w, values)
 		return
 	}
-	value := data["label_values"].(string)
-	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
-	if err := handler.GetServiceManager().UpdateServiceLabel(serviceID, value); err != nil {
-		httputil.ReturnError(r, w, 500, fmt.Sprintf("update service label error, %v", err))
-		return
-	}
-	httputil.ReturnSuccess(r, w, nil)
-}
 
-//NodeLabel label
-func (t *TenantStruct) NodeLabel(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "DELETE":
-		t.DeleteNodeLabel(w, r)
+		t.DeleteLabel(w, r, &req)
 	case "POST":
-		t.AddNodeLabel(w, r)
+		t.AddLabel(w, r, &req)
+	case "PUT":
+		t.UpdateLabel(w, r, &req)
 	}
 }
 
-//AddNodeLabel AddNodeLabel
-func (t *TenantStruct) AddNodeLabel(w http.ResponseWriter, r *http.Request) {
-	// swagger:operation POST  /v2/tenants/{tenant_name}/services/{service_alias}/node-label v2 addNodeLabel
-	//
-	// 添加节点标签
-	//
-	// add node label
-	//
-	// ---
-	// consumes:
-	// - application/json
-	// - application/x-protobuf
-	//
-	// produces:
-	// - application/json
-	// - application/xml
-	//
-	// responses:
-	//   default:
-	//     schema:
-	//       "$ref": "#/responses/commandResponse"
-	//     description: 统一返回格式
-
-	var labels api_model.AddNodeLabelStruct
-	ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &labels.Body, nil)
-	if !ok {
-		return
-	}
-	//logrus.Info(labels.Body.LabelValues)
-	valueList := labels.Body.LabelValues
+// AddLabel adds label
+func (t *TenantStruct) AddLabel(w http.ResponseWriter, r *http.Request, labels *api_model.LabelsStruct) {
+	logrus.Debugf("add label")
 	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
-	if err := handler.GetServiceManager().AddLabel("node", serviceID, valueList); err != nil {
-		httputil.ReturnError(r, w, 500, fmt.Sprintf("add node label failure, %v", err))
+	if err := handler.GetServiceManager().AddLabel(labels, serviceID); err != nil {
+		httputil.ReturnError(r, w, 500, fmt.Sprintf("add label error, %v", err))
 		return
 	}
 	httputil.ReturnSuccess(r, w, nil)
 }
 
-//DeleteNodeLabel DeleteLabel
-func (t *TenantStruct) DeleteNodeLabel(w http.ResponseWriter, r *http.Request) {
-	// swagger:operation DELETE  /v2/tenants/{tenant_name}/services/{service_alias}/node-label v2 deleteNodeLabel
-	//
-	// 删除节点标签
-	//
-	// delete node label
-	//
-	// ---
-	// consumes:
-	// - application/json
-	// - application/x-protobuf
-	//
-	// produces:
-	// - application/json
-	// - application/xml
-	//
-	// responses:
-	//   default:
-	//     schema:
-	//       "$ref": "#/responses/commandResponse"
-	//     description: 统一返回格式
-
-	var labels api_model.AddNodeLabelStruct
-	ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &labels.Body, nil)
-	if !ok {
+// DeleteLabel deletes labels
+func (t *TenantStruct) DeleteLabel(w http.ResponseWriter, r *http.Request, labels *api_model.LabelsStruct) {
+	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
+	if err := handler.GetServiceManager().DeleteLabel(labels, serviceID); err != nil {
+		httputil.ReturnError(r, w, 500, fmt.Sprintf("delete node label failure, %v", err))
 		return
 	}
-	//logrus.Info(labels.Body.LabelValues)
-	valueList := labels.Body.LabelValues
+	httputil.ReturnSuccess(r, w, nil)
+}
+
+//UpdateLabel Update updates labels
+func (t *TenantStruct) UpdateLabel(w http.ResponseWriter, r *http.Request, labels *api_model.LabelsStruct) {
 	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
-	if err := handler.GetServiceManager().DeleteLabel("node", serviceID, valueList); err != nil {
-		httputil.ReturnError(r, w, 500, fmt.Sprintf("delete node label failure, %v", err))
+	if err := handler.GetServiceManager().UpdateLabel(labels, serviceID); err != nil {
+		httputil.ReturnError(r, w, 500, fmt.Sprintf("error updating label: %v", err))
 		return
 	}
 	httputil.ReturnSuccess(r, w, nil)
@@ -1009,8 +975,15 @@ func (t *TenantStruct) GetSingleServiceInfo(w http.ResponseWriter, r *http.Reque
 //     description: 统一返回格式
 func (t *TenantStruct) DeleteSingleServiceInfo(w http.ResponseWriter, r *http.Request) {
 	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
-	if err := handler.GetServiceManager().TransServieToDelete(serviceID); err != nil {
-		if err == fmt.Errorf("unclosed") {
+	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)
+	var req api_model.EtcdCleanReq
+	if httputil.ValidatorRequestStructAndErrorResponse(r, w, &req, nil) {
+		logrus.Debugf("delete service etcd keys : %+v", req.Keys)
+		handler.GetEtcdHandler().CleanAllServiceData(req.Keys)
+	}
+
+	if err := handler.GetServiceManager().TransServieToDelete(tenantID, serviceID); err != nil {
+		if err == handler.ErrServiceNotClosed {
 			httputil.ReturnError(r, w, 400, fmt.Sprintf("Service must be closed"))
 			return
 		}
@@ -1168,6 +1141,10 @@ func (t *TenantStruct) AddEnv(w http.ResponseWriter, r *http.Request) {
 	envD.Name = envM.Name
 	envD.Scope = envM.Scope
 	if err := handler.GetServiceManager().EnvAttr("add", &envD); err != nil {
+		if err == errors.ErrRecordAlreadyExist {
+			httputil.ReturnError(r, w, 400, fmt.Sprintf("%v", err))
+			return
+		}
 		logrus.Errorf("Add env error, %v", err)
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("Add env error, %v", err))
 		return
@@ -1471,7 +1448,25 @@ func (t *TenantStruct) PortOuterController(w http.ResponseWriter, r *http.Reques
 	if !httputil.ValidatorRequestStructAndErrorResponse(r, w, &(data.Body), nil) {
 		return
 	}
+
 	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
+	service := r.Context().Value(middleware.ContextKey("service")).(*dbmodel.TenantServices)
+	if dbmodel.ServiceKind(service.Kind) == dbmodel.ServiceKindThirdParty {
+		endpoints, err := db.GetManager().EndpointsDao().List(serviceID)
+		if err != nil {
+			logrus.Errorf("find endpoints by sid[%s], error: %s", serviceID, err.Error())
+			httputil.ReturnError(r, w, 500, "fund endpoints failure")
+			return
+		}
+		for _, ep := range endpoints {
+			address := validation.SplitEndpointAddress(ep.IP)
+			if validation.IsDomainNotIP(address) {
+				httputil.ReturnError(r, w, 400, "do not allow operate outer port for thirdpart domain endpoints")
+				return
+			}
+		}
+	}
+
 	tenantName := r.Context().Value(middleware.ContextKey("tenant_name")).(string)
 	portStr := chi.URLParam(r, "port")
 	containerPort, err := strconv.Atoi(portStr)
@@ -1479,7 +1474,7 @@ func (t *TenantStruct) PortOuterController(w http.ResponseWriter, r *http.Reques
 		httputil.ReturnError(r, w, 400, "port must be a number")
 		return
 	}
-	vsPort, protocol, errV := handler.GetServiceManager().PortOuter(tenantName, serviceID, data.Body.Operation, containerPort)
+	vsPort, protocol, errV := handler.GetServiceManager().PortOuter(tenantName, serviceID, containerPort, &data)
 	if errV != nil {
 		if strings.HasSuffix(errV.Error(), gorm.ErrRecordNotFound.Error()) {
 			httputil.ReturnError(r, w, 404, errV.Error())
@@ -1502,10 +1497,20 @@ func (t *TenantStruct) PortOuterController(w http.ResponseWriter, r *http.Reques
 		} else {
 			rc["port"] = "10080"
 		}
-	} else if vsPort != nil && vsPort.Port != 0 {
+	} else if vsPort != nil {
 		rc["domain"] = mm[0]
 		rc["port"] = fmt.Sprintf("%v", vsPort.Port)
 	}
+
+	if err := handler.GetGatewayHandler().SendTask(map[string]interface{}{
+		"service_id": serviceID,
+		"action":     "port-" + data.Body.Operation,
+		"port":       containerPort,
+		"is_inner":   false,
+	}); err != nil {
+		logrus.Errorf("send runtime message about gateway failure %s", err.Error())
+	}
+
 	httputil.ReturnSuccess(r, w, rc)
 }
 
@@ -1555,30 +1560,17 @@ func (t *TenantStruct) PortInnerController(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	httputil.ReturnSuccess(r, w, nil)
-}
 
-//ChangeLBPort change lb mapping port
-//only support change to existing port in this tenants
-func (t *TenantStruct) ChangeLBPort(w http.ResponseWriter, r *http.Request) {
-	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
-	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)
-	portStr := chi.URLParam(r, "port")
-	containerPort, err := strconv.Atoi(portStr)
-	if err != nil {
-		httputil.ReturnError(r, w, 400, "port must be a number")
-		return
+	if err := handler.GetGatewayHandler().SendTask(map[string]interface{}{
+		"service_id": serviceID,
+		"action":     "port-" + data.Body.Operation,
+		"port":       containerPort,
+		"is_inner":   true,
+	}); err != nil {
+		logrus.Errorf("send runtime message about gateway failure %s", err.Error())
 	}
-	var data api_model.ServiceLBPortChange
-	if !httputil.ValidatorRequestStructAndErrorResponse(r, w, &(data.Body), nil) {
-		return
-	}
-	mapport, errc := handler.GetServiceManager().ChangeLBPort(tenantID, serviceID, containerPort, data.Body.ChangePort)
-	if errc != nil {
-		errc.Handle(r, w)
-		return
-	}
-	httputil.ReturnSuccess(r, w, mapport)
+
+	httputil.ReturnSuccess(r, w, nil)
 }
 
 //Pods pods
@@ -1607,9 +1599,11 @@ func (t *TenantStruct) Pods(w http.ResponseWriter, r *http.Request) {
 	pods, err := handler.GetServiceManager().GetPods(serviceID)
 	if err != nil {
 		if err.Error() == gorm.ErrRecordNotFound.Error() {
+			logrus.Error("record not found:", err)
 			httputil.ReturnError(r, w, 404, fmt.Sprintf("get pods error, %v", err))
 			return
 		}
+		logrus.Error("get pods error:", err)
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("get pods error, %v", err))
 		return
 	}
@@ -1655,13 +1649,13 @@ func (t *TenantStruct) AddProbe(w http.ResponseWriter, r *http.Request) {
 	if ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &tsp, nil); !ok {
 		return
 	}
-	var tspD dbmodel.ServiceProbe
+	var tspD dbmodel.TenantServiceProbe
 	tspD.ServiceID = serviceID
 	tspD.Cmd = tsp.Cmd
 	tspD.FailureThreshold = tsp.FailureThreshold
 	tspD.HTTPHeader = tsp.HTTPHeader
 	tspD.InitialDelaySecond = tsp.InitialDelaySecond
-	tspD.IsUsed = tsp.IsUsed
+	tspD.IsUsed = &tsp.IsUsed
 	tspD.Mode = tsp.Mode
 	tspD.Path = tsp.Path
 	tspD.PeriodSecond = tsp.PeriodSecond
@@ -1670,11 +1664,13 @@ func (t *TenantStruct) AddProbe(w http.ResponseWriter, r *http.Request) {
 	tspD.Scheme = tsp.Scheme
 	tspD.SuccessThreshold = tsp.SuccessThreshold
 	tspD.TimeoutSecond = tsp.TimeoutSecond
+	tspD.FailureAction = tsp.FailureAction
 	//注意端口问题
 	if err := handler.GetServiceManager().ServiceProbe(&tspD, "add"); err != nil {
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("add service probe error, %v", err))
 		return
 	}
+	httputil.ReturnSuccess(r, w, nil)
 }
 
 //UpdateProbe update probe
@@ -1704,13 +1700,13 @@ func (t *TenantStruct) UpdateProbe(w http.ResponseWriter, r *http.Request) {
 	if ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &tsp, nil); !ok {
 		return
 	}
-	var tspD dbmodel.ServiceProbe
+	var tspD dbmodel.TenantServiceProbe
 	tspD.ServiceID = serviceID
 	tspD.Cmd = tsp.Cmd
 	tspD.FailureThreshold = tsp.FailureThreshold
 	tspD.HTTPHeader = tsp.HTTPHeader
 	tspD.InitialDelaySecond = tsp.InitialDelaySecond
-	tspD.IsUsed = tsp.IsUsed
+	tspD.IsUsed = &tsp.IsUsed
 	tspD.Mode = tsp.Mode
 	tspD.Path = tsp.Path
 	tspD.PeriodSecond = tsp.PeriodSecond
@@ -1728,6 +1724,7 @@ func (t *TenantStruct) UpdateProbe(w http.ResponseWriter, r *http.Request) {
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("update service probe error, %v", err))
 		return
 	}
+	httputil.ReturnSuccess(r, w, nil)
 }
 
 //DeleteProbe delete probe
@@ -1757,7 +1754,7 @@ func (t *TenantStruct) DeleteProbe(w http.ResponseWriter, r *http.Request) {
 	if ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &tsp, nil); !ok {
 		return
 	}
-	var tspD dbmodel.ServiceProbe
+	var tspD dbmodel.TenantServiceProbe
 	tspD.ServiceID = serviceID
 	tspD.ProbeID = tsp.ProbeID
 	//注意端口问题
@@ -1769,6 +1766,7 @@ func (t *TenantStruct) DeleteProbe(w http.ResponseWriter, r *http.Request) {
 		httputil.ReturnError(r, w, 500, fmt.Sprintf("delete service probe error, %v", err))
 		return
 	}
+	httputil.ReturnSuccess(r, w, nil)
 }
 
 //Port Port

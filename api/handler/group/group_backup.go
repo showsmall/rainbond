@@ -26,25 +26,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
-
-	"github.com/goodrain/rainbond/event"
-
-	"github.com/Sirupsen/logrus"
-	apidb "github.com/goodrain/rainbond/api/db"
-
-	"github.com/goodrain/rainbond/appruntimesync/client"
-
-	"github.com/goodrain/rainbond/mq/api/grpc/pb"
-
 	"github.com/jinzhu/gorm"
-
 	"github.com/pquerna/ffjson/ffjson"
 
 	"github.com/goodrain/rainbond/api/util"
 	"github.com/goodrain/rainbond/db"
+	"github.com/goodrain/rainbond/event"
+	"github.com/goodrain/rainbond/worker/client"
+
 	dbmodel "github.com/goodrain/rainbond/db/model"
+	mqclient "github.com/goodrain/rainbond/mq/client"
 	core_util "github.com/goodrain/rainbond/util"
+	v1 "github.com/goodrain/rainbond/worker/appm/types/v1"
 )
 
 //Backup GroupBackup
@@ -58,37 +53,32 @@ type Backup struct {
 		GroupID    string   `json:"group_id" validate:"group_name|required"`
 		Metadata   string   `json:"metadata,omitempty" validate:"metadata|required"`
 		ServiceIDs []string `json:"service_ids" validate:"service_ids|required"`
-		Mode       string   `json:"mode" validate:"mode|required|in:full-online,full-offline"`
 		Version    string   `json:"version" validate:"version|required"`
-		SlugInfo   struct {
-			Namespace   string `json:"namespace"`
-			FTPHost     string `json:"ftp_host"`
-			FTPPort     string `json:"ftp_port"`
-			FTPUser     string `json:"ftp_username"`
-			FTPPassword string `json:"ftp_password"`
-		} `json:"slug_info,omitempty"`
-		ImageInfo struct {
-			HubURL      string `json:"hub_url"`
-			HubUser     string `json:"hub_user"`
-			HubPassword string `json:"hub_password"`
-			Namespace   string `json:"namespace"`
-			IsTrust     bool   `json:"is_trust,omitempty"`
-		} `json:"image_info,omitempty"`
-		SourceDir string `json:"source_dir"`
-		BackupID  string `json:"backup_id,omitempty"`
+		SourceDir  string   `json:"source_dir"`
+		BackupID   string   `json:"backup_id,omitempty"`
+
+		Mode     string `json:"mode" validate:"mode|required|in:full-online,full-offline"`
+		Force    bool   `json:"force"`
+		S3Config struct {
+			Provider   string `json:"provider"`
+			Endpoint   string `json:"endpoint"`
+			AccessKey  string `json:"access_key"`
+			SecretKey  string `json:"secret_key"`
+			BucketName string `json:"bucket_name"`
+		} `json:"s3_config"`
 	}
 }
 
 //BackupHandle group app backup handle
 type BackupHandle struct {
-	MQClient  pb.TaskQueueClient
+	mqcli     mqclient.MQClient
 	statusCli *client.AppRuntimeSyncClient
 	etcdCli   *clientv3.Client
 }
 
 //CreateBackupHandle CreateBackupHandle
-func CreateBackupHandle(MQClient pb.TaskQueueClient, statusCli *client.AppRuntimeSyncClient, etcdCli *clientv3.Client) *BackupHandle {
-	return &BackupHandle{MQClient: MQClient, statusCli: statusCli, etcdCli: etcdCli}
+func CreateBackupHandle(MQClient mqclient.MQClient, statusCli *client.AppRuntimeSyncClient, etcdCli *clientv3.Client) *BackupHandle {
+	return &BackupHandle{mqcli: MQClient, statusCli: statusCli, etcdCli: etcdCli}
 }
 
 //NewBackup new backup task
@@ -118,9 +108,11 @@ func (h *BackupHandle) NewBackup(b Backup) (*dbmodel.AppBackup, *util.APIHandleE
 	b.Body.SourceDir = sourceDir
 	appBackup.SourceDir = sourceDir
 	//snapshot the app metadata of region and write
-	if err := h.snapshot(b.Body.ServiceIDs, sourceDir); err != nil {
-		os.RemoveAll(sourceDir)
-		if strings.HasPrefix(err.Error(), "Statefulset app must be closed") {
+	if err := h.snapshot(b.Body.ServiceIDs, sourceDir, b.Body.Force); err != nil {
+		if err := os.RemoveAll(sourceDir); err != nil {
+			logrus.Warningf("error removing %s: %v", sourceDir, err)
+		}
+		if strings.HasPrefix(err.Error(), "state app must be closed before backup") {
 			return nil, util.CreateAPIHandleError(401, fmt.Errorf("snapshot group apps error,%s", err))
 		}
 		return nil, util.CreateAPIHandleError(500, fmt.Errorf("snapshot group apps error,%s", err))
@@ -135,28 +127,19 @@ func (h *BackupHandle) NewBackup(b Backup) (*dbmodel.AppBackup, *util.APIHandleE
 	if err := db.GetManager().AppBackupDao().AddModel(&appBackup); err != nil {
 		return nil, util.CreateAPIHandleErrorFromDBError("create backup history", err)
 	}
+	var rollback = func() {
+		_ = db.GetManager().AppBackupDao().DeleteAppBackup(appBackup.BackupID)
+	}
 	//clear metadata
 	b.Body.Metadata = ""
 	b.Body.BackupID = appBackup.BackupID
-	data, err := ffjson.Marshal(b.Body)
-	if err != nil {
-		return nil, util.CreateAPIHandleError(500, fmt.Errorf("build task body data error,%s", err))
-	}
-	//Initiate a data backup task.
-	task := &apidb.BuildTaskStruct{
+	err := h.mqcli.SendBuilderTopic(mqclient.TaskStruct{
+		TaskBody: b.Body,
 		TaskType: "backup_apps_new",
-		TaskBody: data,
-	}
-	eq, err := apidb.BuildTaskBuild(task)
+		Topic:    mqclient.BuilderTopic,
+	})
 	if err != nil {
-		logrus.Error("Failed to BuildTaskBuild for BackupApp:", err)
-		return nil, util.CreateAPIHandleError(500, fmt.Errorf("build task error,%s", err))
-	}
-	// 写入事件到MQ中
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, err = h.MQClient.Enqueue(ctx, eq)
-	if err != nil {
+		rollback()
 		logrus.Error("Failed to Enqueue MQ for BackupApp:", err)
 		return nil, util.CreateAPIHandleError(500, fmt.Errorf("build enqueue task error,%s", err))
 	}
@@ -174,21 +157,29 @@ func (h *BackupHandle) GetBackup(backupID string) (*dbmodel.AppBackup, *util.API
 }
 
 //DeleteBackup delete backup
-func (h *BackupHandle) DeleteBackup(backupID string) *util.APIHandleError {
-	backup, err := h.GetBackup(backupID)
+func (h *BackupHandle) DeleteBackup(backupID string) error {
+	backup, err := db.GetManager().AppBackupDao().GetAppBackup(backupID)
 	if err != nil {
 		return err
 	}
-	//if status != success it could be deleted
-	//if status == success, backup mode must be offline could be deleted
-	if backup.Status != "success" || backup.BackupMode == "full-offline" {
-		backup.Deleted = true
-		if er := db.GetManager().AppBackupDao().UpdateModel(backup); er != nil {
-			return util.CreateAPIHandleErrorFromDBError("delete backup error", er)
-		}
-		return nil
+
+	tx := db.GetManager().Begin()
+	defer db.GetManager().EnsureEndTransactionFunc()(tx)
+
+	if err := db.GetManager().AppBackupDaoTransactions(tx).DeleteAppBackup(backupID); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete backup error: %v", err)
 	}
-	return util.CreateAPIHandleErrorf(400, "backup success do not support delete.")
+
+	if backup.BackupMode == "full-offline" {
+		logrus.Infof("delete from local: %s", backup.SourceDir)
+		if err := os.RemoveAll(backup.SourceDir); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("remove backup directory: %v", err)
+		}
+	}
+
+	return tx.Commit().Error
 }
 
 //GetBackupByGroupID get some backup info by group id
@@ -200,43 +191,57 @@ func (h *BackupHandle) GetBackupByGroupID(groupID string) ([]*dbmodel.AppBackup,
 	return backups, nil
 }
 
+// AppSnapshot holds a snapshot of your app
+type AppSnapshot struct {
+	Services            []*RegionServiceSnapshot
+	Plugins             []*dbmodel.TenantPlugin
+	PluginBuildVersions []*dbmodel.TenantPluginBuildVersion
+}
+
 //RegionServiceSnapshot RegionServiceSnapshot
 type RegionServiceSnapshot struct {
 	ServiceID          string
 	Service            *dbmodel.TenantServices
-	ServiceProbe       []*dbmodel.ServiceProbe
+	ServiceProbe       []*dbmodel.TenantServiceProbe
 	LBMappingPort      []*dbmodel.TenantServiceLBMappingPort
 	ServiceEnv         []*dbmodel.TenantServiceEnvVar
 	ServiceLabel       []*dbmodel.TenantServiceLable
 	ServiceMntRelation []*dbmodel.TenantServiceMountRelation
-	PluginRelation     []*dbmodel.TenantServicePluginRelation
 	ServiceRelation    []*dbmodel.TenantServiceRelation
 	ServiceStatus      string
 	ServiceVolume      []*dbmodel.TenantServiceVolume
+	ServiceConfigFile  []*dbmodel.TenantServiceConfigFile
 	ServicePort        []*dbmodel.TenantServicesPort
 	Versions           []*dbmodel.VersionInfo
+
+	PluginRelation    []*dbmodel.TenantServicePluginRelation
+	PluginConfigs     []*dbmodel.TenantPluginVersionDiscoverConfig
+	PluginEnvs        []*dbmodel.TenantPluginVersionEnv
+	PluginStreamPorts []*dbmodel.TenantServicesStreamPluginPort
 }
 
 //snapshot
-func (h *BackupHandle) snapshot(ids []string, sourceDir string) error {
-	var datas []RegionServiceSnapshot
+func (h *BackupHandle) snapshot(ids []string, sourceDir string, force bool) error {
+	var pluginIDs []string
+	var services []*RegionServiceSnapshot
 	for _, id := range ids {
-		var data = RegionServiceSnapshot{
-			ServiceID: id,
-		}
-		status := h.statusCli.GetStatus(id)
-		serviceType, err := db.GetManager().TenantServiceLabelDao().GetTenantServiceTypeLabel(id)
-		if err != nil {
-			return fmt.Errorf("Get service deploy type error,%s", err.Error())
-		}
-		if status != client.CLOSED && serviceType != nil && serviceType.LabelValue == core_util.StatefulServiceType {
-			return fmt.Errorf("Statefulset app must be closed before backup,%s", err.Error())
-		}
-		data.ServiceStatus = status
 		service, err := db.GetManager().TenantServiceDao().GetServiceByID(id)
 		if err != nil {
 			return fmt.Errorf("Get service(%s) error %s", id, err.Error())
 		}
+		if dbmodel.ServiceKind(service.Kind) == dbmodel.ServiceKindThirdParty {
+			//TODO: support thirdpart service backup and restore
+			continue
+		}
+		data := &RegionServiceSnapshot{
+			ServiceID: id,
+		}
+		status := h.statusCli.GetStatus(id)
+		logrus.Debugf("service: %s is state: %v", service.ServiceAlias, service.IsState())
+		if !force && status != v1.CLOSED && service.IsState() { // state running service force backup
+			return fmt.Errorf("state app must be closed before backup")
+		}
+		data.ServiceStatus = status
 		data.Service = service
 		serviceProbes, err := db.GetManager().ServiceProbeDao().GetServiceProbes(id)
 		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
@@ -263,11 +268,6 @@ func (h *BackupHandle) snapshot(ids []string, sourceDir string) error {
 			return fmt.Errorf("Get service(%s) mnt relations error %s", id, err)
 		}
 		data.ServiceMntRelation = serviceMntRelations
-		servicePlugins, err := db.GetManager().TenantServicePluginRelationDao().GetALLRelationByServiceID(id)
-		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
-			return fmt.Errorf("Get service(%s) plugins error %s", id, err)
-		}
-		data.PluginRelation = servicePlugins
 		serviceRelations, err := db.GetManager().TenantServiceRelationDao().GetTenantServiceRelations(id)
 		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
 			return fmt.Errorf("Get service(%s) relations error %s", id, err)
@@ -278,19 +278,71 @@ func (h *BackupHandle) snapshot(ids []string, sourceDir string) error {
 			return fmt.Errorf("Get service(%s) volume error %s", id, err)
 		}
 		data.ServiceVolume = serviceVolume
+		serviceConfigFile, err := db.GetManager().TenantServiceConfigFileDao().GetConfigFileByServiceID(id)
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return fmt.Errorf("get service(%s) config file error: %s", id, err.Error())
+		}
+		data.ServiceConfigFile = serviceConfigFile
 		servicePorts, err := db.GetManager().TenantServicesPortDao().GetPortsByServiceID(id)
 		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
 			return fmt.Errorf("Get service(%s) ports error %s", id, err)
 		}
 		data.ServicePort = servicePorts
-		versions, err := db.GetManager().VersionInfoDao().GetVersionByServiceID(id)
-		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
+		version, err := db.GetManager().VersionInfoDao().GetLatestScsVersion(id)
+		if err != nil && err != gorm.ErrRecordNotFound {
 			return fmt.Errorf("Get service(%s) build versions error %s", id, err)
 		}
-		data.Versions = versions
-		datas = append(datas, data)
+		if version != nil {
+			logrus.Debugf("service: %s do have build version", service.ServiceAlias)
+			data.Versions = []*dbmodel.VersionInfo{version}
+		}
+
+		pluginReations, err := db.GetManager().TenantServicePluginRelationDao().GetALLRelationByServiceID(id)
+		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
+			return fmt.Errorf("Get service(%s) plugins error %s", id, err)
+		}
+		data.PluginRelation = pluginReations
+		for _, pr := range pluginReations {
+			pluginIDs = append(pluginIDs, pr.PluginID)
+		}
+		pluginConfigs, err := db.GetManager().TenantPluginVersionConfigDao().GetPluginConfigs(id)
+		if err != nil && err.Error() != gorm.ErrRecordNotFound.Error() {
+			return fmt.Errorf("Get service(%s) plugin configs error %s", id, err)
+		}
+		data.PluginConfigs = pluginConfigs
+		pluginEnvs, err := db.GetManager().TenantPluginVersionENVDao().ListByServiceID(id)
+		if err != nil {
+			return fmt.Errorf("service id: %s; failed to list plugin envs: %v", id, err)
+		}
+		data.PluginEnvs = pluginEnvs
+		pluginStreamPorts, err := db.GetManager().TenantServicesStreamPluginPortDao().ListByServiceID(id)
+		if err != nil {
+			return fmt.Errorf("service id: %s; failed to list stream plugin ports: %v", id, err)
+		}
+		data.PluginStreamPorts = pluginStreamPorts
+
+		services = append(services, data)
 	}
-	body, err := ffjson.Marshal(datas)
+	logrus.Debug("service information ok.")
+
+	appSnapshot := &AppSnapshot{
+		Services: services,
+	}
+	// plugin
+	plugins, err := db.GetManager().TenantPluginDao().ListByIDs(pluginIDs)
+	if err != nil {
+		return fmt.Errorf("failed to list plugins: %v", err)
+	}
+	appSnapshot.Plugins = plugins
+	logrus.Debug("plugins ok.")
+	pluginVersions, err := db.GetManager().TenantPluginBuildVersionDao().ListSuccessfulOnesByPluginIDs(pluginIDs)
+	if err != nil {
+		return fmt.Errorf("failed to list successful plugin build versions: %v", err)
+	}
+	appSnapshot.PluginBuildVersions = pluginVersions
+	logrus.Debug("plugin versions ok.")
+
+	body, err := ffjson.Marshal(appSnapshot)
 	if err != nil {
 		return err
 	}
@@ -305,20 +357,6 @@ func (h *BackupHandle) snapshot(ids []string, sourceDir string) error {
 type BackupRestore struct {
 	BackupID string `json:"backup_id"`
 	Body     struct {
-		SlugInfo struct {
-			Namespace   string `json:"namespace"`
-			FTPHost     string `json:"ftp_host"`
-			FTPPort     string `json:"ftp_port"`
-			FTPUser     string `json:"ftp_username"`
-			FTPPassword string `json:"ftp_password"`
-		} `json:"slug_info,omitempty"`
-		ImageInfo struct {
-			HubURL      string `json:"hub_url"`
-			HubUser     string `json:"hub_user"`
-			HubPassword string `json:"hub_password"`
-			Namespace   string `json:"namespace"`
-			IsTrust     bool   `json:"is_trust,omitempty"`
-		} `json:"image_info,omitempty"`
 		EventID string `json:"event_id"`
 		//need restore target tenant id
 		TenantID string `json:"tenant_id"`
@@ -326,6 +364,14 @@ type BackupRestore struct {
 		//RestoreMode(cdot) current datacenter and other tenant
 		//RestoreMode(od)     other datacenter
 		RestoreMode string `json:"restore_mode"`
+
+		S3Config struct {
+			Provider   string `json:"provider"`
+			Endpoint   string `json:"endpoint"`
+			AccessKey  string `json:"access_key"`
+			SecretKey  string `json:"secret_key"`
+			BucketName string `json:"bucket_name"`
+		} `json:"s3_config"`
 	}
 }
 
@@ -368,31 +414,17 @@ func (h *BackupHandle) RestoreBackup(br BackupRestore) (*RestoreResult, *util.AP
 	}
 	restoreID = core_util.NewUUID()
 	var dataMap = map[string]interface{}{
-		"slug_info":    br.Body.SlugInfo,
-		"image_info":   br.Body.ImageInfo,
 		"backup_id":    backup.BackupID,
 		"tenant_id":    br.Body.TenantID,
 		"restore_id":   restoreID,
 		"restore_mode": br.Body.RestoreMode,
+		"s3_config":    br.Body.S3Config,
 	}
-	data, err := ffjson.Marshal(dataMap)
-	if err != nil {
-		return nil, util.CreateAPIHandleErrorf(500, "build task body data error,%s", err)
-	}
-	//Initiate a data backup task.
-	task := &apidb.BuildTaskStruct{
+	err := h.mqcli.SendBuilderTopic(mqclient.TaskStruct{
+		TaskBody: dataMap,
 		TaskType: "backup_apps_restore",
-		TaskBody: data,
-	}
-	eq, err := apidb.BuildTaskBuild(task)
-	if err != nil {
-		logrus.Error("Failed to BuildTaskBuild for BackupApp:", err)
-		return nil, util.CreateAPIHandleError(500, fmt.Errorf("build task error,%s", err))
-	}
-	// 写入事件到MQ中
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, err = h.MQClient.Enqueue(ctx, eq)
+		Topic:    mqclient.BuilderTopic,
+	})
 	if err != nil {
 		logrus.Error("Failed to Enqueue MQ for BackupApp:", err)
 		return nil, util.CreateAPIHandleError(500, fmt.Errorf("build enqueue task error,%s", err))
@@ -406,6 +438,8 @@ func (h *BackupHandle) RestoreBackup(br BackupRestore) (*RestoreResult, *util.AP
 		RestoreID:   restoreID,
 	}
 	body, _ := ffjson.Marshal(rr)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
 	_, err = h.etcdCli.Put(ctx, "/rainbond/backup_restore/"+restoreID, string(body))
 	if err != nil {
 		logrus.Errorf("save backup restore history error.")
@@ -436,14 +470,6 @@ func (h *BackupHandle) RestoreBackupResult(restoreID string) (*RestoreResult, *u
 			return nil, util.CreateAPIHandleError(500, fmt.Errorf("read metadata file error,%s", err))
 		}
 		rr.Metadata = string(body)
-		//set app status
-		for _, v := range rr.ServiceChange {
-			if v.Status == client.UNDEPLOY {
-				h.statusCli.SetStatus(v.ServiceID, client.UNDEPLOY)
-			} else {
-				h.statusCli.SetStatus(v.ServiceID, client.CLOSED)
-			}
-		}
 	}
 	return &rr, nil
 }
@@ -459,7 +485,7 @@ type BackupCopy struct {
 		SourceDir  string `json:"source_dir" validate:"source_dir|required"`
 		SourceType string ` json:"source_type" validate:"source_type|required"`
 		BackupMode string `json:"backup_mode" validate:"backup_mode|required"`
-		BuckupSize int    `json:"backup_size" validate:"backup_size|required"`
+		BuckupSize int64  `json:"backup_size" validate:"backup_size|required"`
 	}
 }
 

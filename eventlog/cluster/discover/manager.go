@@ -19,24 +19,20 @@
 package discover
 
 import (
+	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/goodrain/rainbond/eventlog/conf"
-	"github.com/goodrain/rainbond/eventlog/util"
-
-	"fmt"
-
-	"encoding/json"
-
-	"github.com/Sirupsen/logrus"
-	"github.com/coreos/etcd/client"
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/mvcc/mvccpb"
+	"github.com/goodrain/rainbond/eventlog/conf"
+	"github.com/goodrain/rainbond/eventlog/util"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/twinj/uuid"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -64,7 +60,6 @@ type EtcdDiscoverManager struct {
 	updateChan     chan *Instance
 	log            *logrus.Entry
 	conf           conf.DiscoverConf
-	etcdAPI        client.KeysAPI
 	etcdclientv3   *clientv3.Client
 	selfInstance   *Instance
 	othersInstance []*Instance
@@ -72,7 +67,7 @@ type EtcdDiscoverManager struct {
 }
 
 //New 创建
-func New(conf conf.DiscoverConf, log *logrus.Entry) Manager {
+func New(etcdClient *clientv3.Client, conf conf.DiscoverConf, log *logrus.Entry) Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &EtcdDiscoverManager{
 		conf:           conf,
@@ -83,6 +78,7 @@ func New(conf conf.DiscoverConf, log *logrus.Entry) Manager {
 		delChan:        make(chan *Instance, 2),
 		updateChan:     make(chan *Instance, 2),
 		othersInstance: make([]*Instance, 0),
+		etcdclientv3:   etcdClient,
 	}
 }
 
@@ -121,16 +117,7 @@ func (d *EtcdDiscoverManager) RegisteredInstance(host string, port int, stopRegi
 		instance.PubPort = port
 		instance.DockerLogPort = d.conf.DockerLogPort
 		instance.WebPort = d.conf.WebPort
-		hostID, err := util.GetHostID(d.conf.NodeIDFile)
-		if err != nil {
-			d.log.Error("Read host id from file error.", err.Error())
-			hostID = uuid.NewV4().String()
-		}
-		if len(hostID) < 32 {
-			d.log.Error("Read host id from file error. Invalid hostID ")
-			hostID = uuid.NewV4().String()
-		}
-		instance.HostID = hostID[len(hostID)-12:]
+		instance.HostID = d.conf.NodeID
 		instance.HostName, _ = os.Hostname()
 		instance.Status = "create"
 		data, err := json.Marshal(instance)
@@ -174,15 +161,14 @@ func (d *EtcdDiscoverManager) MonitorUpdateInstances() chan *Instance {
 //Run 启动
 func (d *EtcdDiscoverManager) Run() error {
 	d.log.Info("Discover manager start ")
-	api, err := CreateETCDClient(d.conf)
-	if err != nil {
-		d.log.Error("Create etcd client error.", err.Error())
-		return err
-	}
-	d.etcdAPI = api
-	d.etcdclientv3, err = clientv3.New(clientv3.Config{
+	etcdClientArgs := &etcdutil.ClientArgs{
 		Endpoints: d.conf.EtcdAddr,
-	})
+		CaFile:    d.conf.EtcdCaFile,
+		CertFile:  d.conf.EtcdCertFile,
+		KeyFile:   d.conf.EtcdKeyFile,
+	}
+	var err error
+	d.etcdclientv3, err = etcdutil.NewClient(d.context, etcdClientArgs)
 	if err != nil {
 		d.log.Error("Create etcd v3 client error.", err.Error())
 		return err
@@ -202,7 +188,7 @@ func (d *EtcdDiscoverManager) discover() {
 			d.log.Error("Get instance info from etcd error.", err.Error())
 		} else {
 			for _, kv := range res.Kvs {
-				node := &client.Node{
+				node := &Node{
 					Key:   string(kv.Key),
 					Value: string(kv.Value),
 				}
@@ -227,7 +213,7 @@ func (d *EtcdDiscoverManager) discover() {
 		}
 
 		for _, event := range res.Events {
-			node := &client.Node{
+			node := &Node{
 				Key:   string(event.Kv.Key),
 				Value: string(event.Kv.Value),
 			}
@@ -264,7 +250,12 @@ func (d *EtcdDiscoverManager) discover() {
 	d.log.Debug("discover manager discover core stop")
 }
 
-func (d *EtcdDiscoverManager) add(node *client.Node) {
+type Node struct {
+	Key   string
+	Value string
+}
+
+func (d *EtcdDiscoverManager) add(node *Node) {
 
 	//忽略自己
 	if strings.HasSuffix(node.Key, fmt.Sprintf("/%s:%d", d.selfInstance.HostIP, d.selfInstance.PubPort)) {
@@ -289,7 +280,7 @@ func (d *EtcdDiscoverManager) add(node *client.Node) {
 		}
 
 		if !isExist {
-			d.log.Infof("Find an instance.IP:%s, Port:%d, HostName:%s HostID: %s", instance.HostIP.String(), instance.PubPort, instance.HostName, instance.HostID)
+			d.log.Infof("Find an instance.IP:%s, Port:%d, NodeID:%s HostID: %s", instance.HostIP.String(), instance.PubPort, instance.HostName, instance.HostID)
 			d.MonitorAddInstances() <- &instance
 			d.othersInstance = append(d.othersInstance, &instance)
 		}
@@ -297,7 +288,7 @@ func (d *EtcdDiscoverManager) add(node *client.Node) {
 
 }
 
-func (d *EtcdDiscoverManager) update(node *client.Node) {
+func (d *EtcdDiscoverManager) update(node *Node) {
 
 	var instance Instance
 	if err := json.Unmarshal([]byte(node.Value), &instance); err != nil {
@@ -342,18 +333,10 @@ func (d *EtcdDiscoverManager) CancellationInstance(instance *Instance) {
 	ctx, cancel := context.WithTimeout(d.context, time.Second*5)
 	defer cancel()
 	_, err := d.etcdclientv3.Delete(ctx, fmt.Sprintf("%s/instance/%s:%d", d.conf.HomePath, instance.HostIP, instance.PubPort))
-	if err != nil && !client.IsKeyNotFound(err) {
+	if err != nil {
 		d.log.Error("Cancellation Instance from etcd error.", err.Error())
 	} else {
 		d.log.Info("Cancellation Instance from etcd")
-	}
-	_, err = d.etcdclientv3.Delete(ctx, fmt.Sprintf("/traefik/backends/event_log_event_grpc/servers/%s/url", instance.HostID))
-	if err != nil {
-		d.log.Error("Cancellation Instance from etcdv3 error.", err.Error())
-	}
-	_, err = d.etcdclientv3.Delete(ctx, fmt.Sprintf("/traefik/backends/event_log_event_http/servers/%s/url", instance.HostID))
-	if err != nil {
-		d.log.Error("Cancellation Instance from etcdv3 error.", err.Error())
 	}
 }
 
@@ -368,7 +351,7 @@ func (d *EtcdDiscoverManager) UpdateInstance(instance *Instance) {
 	ctx, cancel := context.WithTimeout(d.context, time.Second*5)
 	defer cancel()
 	_, err = d.etcdclientv3.Put(ctx, fmt.Sprintf("%s/instance/%s:%d", d.conf.HomePath, instance.HostIP, instance.PubPort), string(data))
-	if err != nil && !client.IsKeyNotFound(err) {
+	if err != nil {
 		d.log.Error(" Update Instance from etcd error.", err.Error())
 	}
 }
@@ -416,15 +399,10 @@ func (d *EtcdDiscoverManager) GetInstance(id string) *Instance {
 //Scrape prometheus monitor metrics
 func (d *EtcdDiscoverManager) Scrape(ch chan<- prometheus.Metric, namespace, exporter string) error {
 	instanceDesc := prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, exporter, "instanse_up"),
+		prometheus.BuildFQName(namespace, exporter, "instance_up"),
 		"the instance in cluster status.",
 		[]string{"from", "instance", "status"}, nil,
 	)
-	// if d.selfInstance.Status == "abnormal" || d.selfInstance.Status == "delete" {
-	// 	ch <- prometheus.MustNewConstMetric(instanceDesc, prometheus.GaugeValue, 0, d.selfInstance.HostIP.String(), d.selfInstance.HostIP.String(), d.selfInstance.Status)
-	// } else {
-	// 	ch <- prometheus.MustNewConstMetric(instanceDesc, prometheus.GaugeValue, 1, d.selfInstance.HostIP.String(), d.selfInstance.HostIP.String(), d.selfInstance.Status)
-	// }
 	for _, i := range d.othersInstance {
 		if i.Status == "delete" || i.Status == "abnormal" {
 			ch <- prometheus.MustNewConstMetric(instanceDesc, prometheus.GaugeValue, 0, d.selfInstance.HostIP.String(), i.HostIP.String(), i.Status)

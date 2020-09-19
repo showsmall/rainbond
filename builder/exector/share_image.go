@@ -22,9 +22,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/goodrain/rainbond/builder"
+
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
-	"github.com/docker/engine-api/client"
+	"github.com/docker/docker/client"
 	"github.com/goodrain/rainbond/builder/sources"
 	"github.com/goodrain/rainbond/event"
 	"github.com/pquerna/ffjson/ffjson"
@@ -32,15 +34,17 @@ import (
 
 //ImageShareItem ImageShareItem
 type ImageShareItem struct {
-	Namespace      string `json:"namespace"`
-	TenantName     string `json:"tenant_name"`
-	ServiceID      string `json:"service_id"`
-	ServiceAlias   string `json:"service_alias"`
-	ImageName      string `json:"image_name"`
-	LocalImageName string `json:"local_image_name"`
-	ShareID        string `json:"share_id"`
-	Logger         event.Logger
-	ShareInfo      struct {
+	Namespace          string `json:"namespace"`
+	TenantName         string `json:"tenant_name"`
+	ServiceID          string `json:"service_id"`
+	ServiceAlias       string `json:"service_alias"`
+	ImageName          string `json:"image_name"`
+	LocalImageName     string `json:"local_image_name"`
+	LocalImageUsername string `json:"-"`
+	LocalImagePassword string `json:"-"`
+	ShareID            string `json:"share_id"`
+	Logger             event.Logger
+	ShareInfo          struct {
 		ServiceKey string `json:"service_key" `
 		AppVersion string `json:"app_version" `
 		EventID    string `json:"event_id"`
@@ -64,19 +68,19 @@ func NewImageShareItem(in []byte, DockerClient *client.Client, EtcdCli *clientv3
 	if err := ffjson.Unmarshal(in, &isi); err != nil {
 		return nil, err
 	}
+	isi.LocalImageUsername = builder.REGISTRYUSER
+	isi.LocalImagePassword = builder.REGISTRYPASS
 	eventID := isi.ShareInfo.EventID
 	isi.Logger = event.GetManager().GetLogger(eventID)
 	isi.DockerClient = DockerClient
 	isi.EtcdCli = EtcdCli
-	if isi.ShareInfo.ImageInfo.HubURL == "hub.goodrain.com" {
-		isi.ShareInfo.ImageInfo.IsTrust = true
-	}
 	return &isi, nil
 }
 
 //ShareService ShareService
 func (i *ImageShareItem) ShareService() error {
-	_, err := sources.ImagePull(i.DockerClient, i.LocalImageName, "", "", i.Logger, 10)
+	hubuser, hubpass := builder.GetImageUserInfo(i.LocalImageUsername, i.LocalImagePassword)
+	_, err := sources.ImagePull(i.DockerClient, i.LocalImageName, hubuser, hubpass, i.Logger, 20)
 	if err != nil {
 		logrus.Errorf("pull image %s error: %s", i.LocalImageName, err.Error())
 		i.Logger.Error(fmt.Sprintf("拉取应用镜像: %s失败", i.LocalImageName), map[string]string{"step": "builder-exector", "status": "failure"})
@@ -87,10 +91,11 @@ func (i *ImageShareItem) ShareService() error {
 		i.Logger.Error(fmt.Sprintf("修改镜像tag: %s -> %s 失败", i.LocalImageName, i.ImageName), map[string]string{"step": "builder-exector", "status": "failure"})
 		return err
 	}
+	user, pass := builder.GetImageUserInfo(i.ShareInfo.ImageInfo.HubUser, i.ShareInfo.ImageInfo.HubPassword)
 	if i.ShareInfo.ImageInfo.IsTrust {
-		err = sources.TrustedImagePush(i.DockerClient, i.ImageName, i.ShareInfo.ImageInfo.HubUser, i.ShareInfo.ImageInfo.HubPassword, i.Logger, 8)
+		err = sources.TrustedImagePush(i.DockerClient, i.ImageName, user, pass, i.Logger, 30)
 	} else {
-		err = sources.ImagePush(i.DockerClient, i.ImageName, i.ShareInfo.ImageInfo.HubUser, i.ShareInfo.ImageInfo.HubPassword, i.Logger, 8)
+		err = sources.ImagePush(i.DockerClient, i.ImageName, user, pass, i.Logger, 30)
 	}
 	if err != nil {
 		if err.Error() == "authentication required" {

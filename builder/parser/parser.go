@@ -20,29 +20,18 @@ package parser
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
+	dbmodel "github.com/goodrain/rainbond/db/model"
+
+	"github.com/sirupsen/logrus"
+	"github.com/docker/distribution/reference"
 	"github.com/goodrain/rainbond/builder/parser/code"
+	"github.com/goodrain/rainbond/builder/parser/discovery"
+	"github.com/goodrain/rainbond/builder/parser/types"
+	"github.com/goodrain/rainbond/builder/sources"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
-
-//Port 端口
-type Port struct {
-	ContainerPort int    `json:"container_port"`
-	Protocol      string `json:"protocol"`
-}
-
-//Volume 存储地址
-type Volume struct {
-	VolumePath string `json:"volume_path"`
-	VolumeType string `json:"volume_type"`
-}
-
-//Env env desc
-type Env struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
 
 //ParseError 错误信息
 type ParseError struct {
@@ -110,12 +99,65 @@ func (ps ParseErrorList) IsFatalError() bool {
 
 //Image 镜像
 type Image struct {
-	Name string `json:"name"`
-	Tag  string `json:"tag"`
+	name   reference.Named
+	source string
+	Name   string `json:"name"`
+	Tag    string `json:"tag"`
 }
 
+//String -
 func (i Image) String() string {
-	return fmt.Sprintf("%s:%s", i.Name, i.Tag)
+	if i.name == nil {
+		return ""
+	}
+	return i.name.String()
+}
+
+//Source return the name before resolution
+func (i Image) Source() string {
+	return i.source
+}
+
+//GetTag get tag
+func (i Image) GetTag() string {
+	return i.Tag
+}
+
+//GetRepostory get repostory
+func (i Image) GetRepostory() string {
+	if i.name == nil {
+		return ""
+	}
+	return reference.Path(i.name)
+}
+
+//GetDomain get image registry domain
+func (i Image) GetDomain() string {
+	if i.name == nil {
+		return ""
+	}
+	domain := reference.Domain(i.name)
+	if domain == "docker.io" {
+		domain = "registry-1.docker.io"
+	}
+	return domain
+}
+
+//IsOfficial is official image
+func (i Image) IsOfficial() bool {
+	domain := reference.Domain(i.name)
+	if domain == "docker.io" {
+		return true
+	}
+	return false
+}
+
+//GetSimpleName get image name without tag and organizations
+func (i Image) GetSimpleName() string {
+	if strings.Contains(i.GetRepostory(), "/") {
+		return strings.Split(i.GetRepostory(), "/")[1]
+	}
+	return i.GetRepostory()
 }
 
 //Parser 解析器
@@ -130,20 +172,25 @@ type Lang string
 
 //ServiceInfo 智能获取的应用信息
 type ServiceInfo struct {
-	Ports             []Port    `json:"ports"`
-	Envs              []Env     `json:"envs"`
-	Volumes           []Volume  `json:"volumes"`
-	Image             Image     `json:"image"`
-	Args              []string  `json:"args"`
-	DependServices    []string  `json:"depends,omitempty"`
-	ServiceDeployType string    `json:"deploy_type,omitempty"`
-	Branchs           []string  `json:"branchs,omitempty"`
-	Memory            int       `json:"memory"`
-	Lang              code.Lang `json:"language"`
-	Runtime           bool      `json:"runtime"`
-	Dependencies      bool      `json:"dependencies"`
-	Procfile          bool      `json:"procfile"`
-	ImageAlias        string    `json:"image_alias"`
+	ID             string         `json:"id,omitempty"`
+	Ports          []types.Port   `json:"ports,omitempty"`
+	Envs           []types.Env    `json:"envs,omitempty"`
+	Volumes        []types.Volume `json:"volumes,omitempty"`
+	Image          Image          `json:"image,omitempty"`
+	Args           []string       `json:"args,omitempty"`
+	DependServices []string       `json:"depends,omitempty"`
+	ServiceType    string         `json:"service_type,omitempty"`
+	Branchs        []string       `json:"branchs,omitempty"`
+	Memory         int            `json:"memory,omitempty"`
+	Lang           code.Lang      `json:"language,omitempty"`
+	ImageAlias     string         `json:"image_alias,omitempty"`
+	//For third party services
+	Endpoints []*discovery.Endpoint `json:"endpoints,omitempty"`
+	//os type,default linux
+	OS        string `json:"os"`
+	Name      string `json:"name,omitempty"`  // module name
+	Cname     string `json:"cname,omitempty"` // service cname
+	Packaging string `json:"packaging,omitempty"`
 }
 
 //GetServiceInfo GetServiceInfo
@@ -184,39 +231,96 @@ func GetPortProtocol(port int) string {
 	return "http"
 }
 
+var dbImageKey = []string{
+	"mysql", "mariadb", "mongo", "redis", "tidb",
+	"zookeeper", "kafka", "mysqldb", "mongodb",
+	"memcached", "cockroachdb", "cockroach", "etcd",
+	"postgres", "postgresql", "elasticsearch", "consul",
+	"percona", "mysql-server", "mysql-cluster",
+}
+
+//DetermineDeployType Determine the deployment type
+// if image like db image,return stateful type
+func DetermineDeployType(imageName Image) string {
+	for _, key := range dbImageKey {
+		if strings.ToLower(imageName.GetSimpleName()) == key {
+			return dbmodel.ServiceTypeStateSingleton.String()
+		}
+	}
+	return dbmodel.ServiceTypeStatelessMultiple.String()
+}
+
 //readmemory
 //10m 10
 //10g 10*1024
 //10k 128
 //10b 128
 func readmemory(s string) int {
-	if strings.HasSuffix(s, "m") {
-		s, err := strconv.Atoi(s[0 : len(s)-1])
-		if err != nil {
-			return 128
-		}
-		return s
+	def := 512
+	s = strings.ToLower(s)
+	// <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+	isValid := false
+	validUnits := map[string]string{
+		"gi": "Gi", "mi": "Mi", "ki": "Ki",
 	}
-	if strings.HasSuffix(s, "g") {
-		s, err := strconv.Atoi(s[0 : len(s)-1])
-		if err != nil {
-			return 128
+	for k, v := range validUnits {
+		if strings.Contains(s, k) {
+			isValid = true
+			s = strings.Replace(s, k, v, 1)
+			break
 		}
-		return s * 1024
 	}
-	return 128
+	if !isValid {
+		validUnits := map[string]string{
+			"g": "Gi", "m": "Mi", "k": "Ki",
+		}
+		for k, v := range validUnits {
+			if strings.Contains(s, k) {
+				isValid = true
+				s = strings.Replace(s, k, v, 1)
+				break
+			}
+		}
+	}
+	if !isValid {
+		logrus.Warningf("s: %s; invalid unit", s)
+		return def
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		logrus.Warningf("s: %s; failed to parse quantity: %v", s, err)
+		return def
+	}
+	re, ok := q.AsInt64()
+	if !ok {
+		logrus.Warningf("failed to int64: %d", re)
+		return def
+	}
+	if re != 0 {
+		return int(re) / (1024 * 1024)
+	}
+	return def
 }
 
-func parseImageName(s string) Image {
-	index := strings.Index(s, ":")
-	if index > -1 {
-		return Image{
-			Name: s[0:index],
-			Tag:  s[index+1:],
-		}
+//ParseImageName parse image name
+func ParseImageName(s string) (i Image) {
+	ref, err := reference.ParseAnyReference(s)
+	if err != nil {
+		logrus.Errorf("image name: %s; parse image failure %s", s, err.Error())
+		return i
 	}
-	return Image{
-		Name: s,
-		Tag:  "latest",
+	name, err := reference.ParseNamed(ref.String())
+	if err != nil {
+		logrus.Errorf("parse image failure %s", err.Error())
+		return i
 	}
+	i.name = name
+	i.Tag = sources.GetTagFromNamedRef(name)
+	if strings.Contains(s, ":") {
+		i.Name = s[:len(s)-(len(i.Tag)+1)]
+	} else {
+		i.Name = s
+	}
+	i.source = s
+	return
 }

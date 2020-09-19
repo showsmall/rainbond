@@ -22,20 +22,20 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/goodrain/rainbond/mq/client"
+
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
-	api_db "github.com/goodrain/rainbond/api/db"
 	"github.com/goodrain/rainbond/api/util"
 	"github.com/goodrain/rainbond/builder/exector"
 	"github.com/goodrain/rainbond/db"
-	"github.com/goodrain/rainbond/mq/api/grpc/pb"
 	"github.com/pquerna/ffjson/ffjson"
 	"github.com/twinj/uuid"
 )
 
 //PluginShareHandle plugin share
 type PluginShareHandle struct {
-	MQClient pb.TaskQueueClient
+	MQClient client.MQClient
 	EtcdCli  *clientv3.Client
 }
 
@@ -65,16 +65,16 @@ type PluginShare struct {
 		ShareUser     string `json:"share_user"`
 		ShareScope    string `json:"share_scope"`
 		ImageInfo     struct {
-			HubURL      string `json:"hub_url" validate:"hub_url|required"`
+			HubURL      string `json:"hub_url"`
 			HubUser     string `json:"hub_user"`
 			HubPassword string `json:"hub_password"`
-			Namespace   string `json:"namespace" validate:"namespace|required"`
+			Namespace   string `json:"namespace"`
 			IsTrust     bool   `json:"is_trust,omitempty" validate:"is_trust"`
 		} `json:"image_info,omitempty"`
 	}
 }
 
-//Share 分享应用
+//Share share app
 func (s *PluginShareHandle) Share(ss PluginShare) (*PluginResult, *util.APIHandleError) {
 	_, err := db.GetManager().TenantPluginDao().GetPluginByID(ss.PluginID, ss.TenantID)
 	if err != nil {
@@ -87,10 +87,9 @@ func (s *PluginShareHandle) Share(ss PluginShare) (*PluginResult, *util.APIHandl
 		return nil, util.CreateAPIHandleErrorFromDBError("query plugin version error", err)
 	}
 	shareID := uuid.NewV4().String()
-	var bs api_db.BuildTaskStruct
 	shareImageName, err := version.CreateShareImage(ss.Body.ImageInfo.HubURL, ss.Body.ImageInfo.Namespace)
 	if err != nil {
-		return nil, util.CreateAPIHandleErrorf(500, "create share image name error", err)
+		return nil, util.CreateAPIHandleErrorf(500, "create share image name error:%s", err.Error())
 	}
 	info := map[string]interface{}{
 		"image_info":       ss.Body.ImageInfo,
@@ -100,14 +99,11 @@ func (s *PluginShareHandle) Share(ss PluginShare) (*PluginResult, *util.APIHandl
 		"share_id":         shareID,
 		"local_image_name": version.BuildLocalImage,
 	}
-	body, _ := ffjson.Marshal(info)
-	bs.TaskType = "share-plugin"
-	bs.TaskBody = body
-	bs.User = ss.Body.ShareUser
-	eq, _ := api_db.BuildTaskBuild(&bs)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, err = s.MQClient.Enqueue(ctx, eq)
+	err = s.MQClient.SendBuilderTopic(client.TaskStruct{
+		TaskType: "share-plugin",
+		TaskBody: info,
+		Topic:    client.BuilderTopic,
+	})
 	if err != nil {
 		logrus.Errorf("equque mq error, %v", err)
 		return nil, util.CreateAPIHandleError(502, err)

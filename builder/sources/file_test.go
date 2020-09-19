@@ -24,11 +24,6 @@ import (
 	"github.com/goodrain/rainbond/event"
 )
 
-func init() {
-	event.NewManager(event.EventConfig{
-		DiscoverAddress: []string{"127.0.0.1:2379"},
-	})
-}
 func TestCopyFileWithProgress(t *testing.T) {
 	logger := event.GetManager().GetLogger("system")
 	if err := CopyFileWithProgress("/tmp/src.tgz", "/tmp/abc/desc1.tgz", logger); err != nil {

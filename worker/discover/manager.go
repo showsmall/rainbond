@@ -20,24 +20,31 @@ package discover
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
+	"github.com/sirupsen/logrus"
+	"github.com/eapache/channels"
 	"github.com/goodrain/rainbond/cmd/worker/option"
-	status "github.com/goodrain/rainbond/appruntimesync/client"
-	"github.com/goodrain/rainbond/mq/api/grpc/client"
 	"github.com/goodrain/rainbond/mq/api/grpc/pb"
+	"github.com/goodrain/rainbond/mq/client"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
+	"github.com/goodrain/rainbond/worker/appm/controller"
+	"github.com/goodrain/rainbond/worker/appm/store"
 	"github.com/goodrain/rainbond/worker/discover/model"
-	"github.com/goodrain/rainbond/worker/executor"
+	"github.com/goodrain/rainbond/worker/gc"
 	"github.com/goodrain/rainbond/worker/handle"
-
 	grpc1 "google.golang.org/grpc"
-
-	"github.com/Sirupsen/logrus"
 )
 
-//WTOPIC is worker
-const WTOPIC string = "worker"
+var healthStatus = make(map[string]string, 1)
+
+//TaskNum exec task number
+var TaskNum float64
+
+//TaskError exec error task number
+var TaskError float64
 
 //TaskManager task
 type TaskManager struct {
@@ -45,26 +52,41 @@ type TaskManager struct {
 	cancel        context.CancelFunc
 	config        option.Config
 	handleManager *handle.Manager
-	client        *client.MQClient
+	client        client.MQClient
 }
 
 //NewTaskManager return *TaskManager
-func NewTaskManager(c option.Config, executor executor.Manager, statusManager *status.AppRuntimeSyncClient) *TaskManager {
+func NewTaskManager(cfg option.Config,
+	store store.Storer,
+	controllermanager *controller.Manager,
+	garbageCollector *gc.GarbageCollector,
+	startCh *channels.RingChannel) *TaskManager {
+
 	ctx, cancel := context.WithCancel(context.Background())
-	handleManager := handle.NewManager(ctx, c, executor, statusManager)
+	handleManager := handle.NewManager(ctx, cfg, store, controllermanager, garbageCollector, startCh)
+	healthStatus["status"] = "health"
+	healthStatus["info"] = "worker service health"
 	return &TaskManager{
 		ctx:           ctx,
 		cancel:        cancel,
-		config:        c,
+		config:        cfg,
 		handleManager: handleManager,
 	}
 }
 
 //Start 启动
 func (t *TaskManager) Start() error {
-	client, err := client.NewMqClient(t.config.EtcdEndPoints, t.config.MQAPI)
+	etcdClientArgs := &etcdutil.ClientArgs{
+		Endpoints: t.config.EtcdEndPoints,
+		CaFile:    t.config.EtcdCaFile,
+		CertFile:  t.config.EtcdCertFile,
+		KeyFile:   t.config.EtcdKeyFile,
+	}
+	client, err := client.NewMqClient(etcdClientArgs, t.config.MQAPI)
 	if err != nil {
 		logrus.Errorf("new Mq client error, %v", err)
+		healthStatus["status"] = "unusual"
+		healthStatus["info"] = fmt.Sprintf("new Mq client error, %v", err)
 		return err
 	}
 	t.client = client
@@ -83,7 +105,7 @@ func (t *TaskManager) Do() {
 			return
 		default:
 			ctx, cancel := context.WithCancel(t.ctx)
-			data, err := t.client.Dequeue(ctx, &pb.DequeueRequest{Topic: WTOPIC, ClientHost: hostname + "-worker"})
+			data, err := t.client.Dequeue(ctx, &pb.DequeueRequest{Topic: client.WorkerTopic, ClientHost: hostname + "-worker"})
 			cancel()
 			if err != nil {
 				if grpc1.ErrorDesc(err) == context.DeadlineExceeded.Error() {
@@ -91,6 +113,8 @@ func (t *TaskManager) Do() {
 				}
 				if grpc1.ErrorDesc(err) == "context canceled" {
 					logrus.Info("receive task core context canceled")
+					healthStatus["status"] = "unusual"
+					healthStatus["info"] = "receive task core context canceled"
 					return
 				}
 				if grpc1.ErrorDesc(err) == "context timeout" {
@@ -107,21 +131,27 @@ func (t *TaskManager) Do() {
 				continue
 			}
 			rc := t.handleManager.AnalystToExec(transData)
-			if rc == 9 {
-				logrus.Debugf("rc is 9, enqueue task to mq")
+			if rc != nil && rc != handle.ErrCallback {
+				logrus.Warningf("execute task: %v", rc)
+				TaskError++
+			} else if rc != nil && rc == handle.ErrCallback {
+				logrus.Errorf("err callback; analyst to exet: %v", rc)
 				ctx, cancel := context.WithCancel(t.ctx)
 				reply, err := t.client.Enqueue(ctx, &pb.EnqueueRequest{
-					Topic:   WTOPIC,
+					Topic:   client.WorkerTopic,
 					Message: data,
 				})
 				cancel()
 				logrus.Debugf("retry send task to mq ,reply is %v", reply)
 				if err != nil {
-					logrus.Errorf("enqueue task %v to mq topic %v Error", data, WTOPIC)
+					logrus.Errorf("enqueue task %v to mq topic %v Error", data, client.WorkerTopic)
 					continue
 				}
+				//if handle is waiting, sleep 3 second
+				time.Sleep(time.Second * 3)
+			} else {
+				TaskNum++
 			}
-			logrus.Debugf("handle task AnalystToExec %d", rc)
 		}
 	}
 }
@@ -134,4 +164,9 @@ func (t *TaskManager) Stop() error {
 		t.client.Close()
 	}
 	return nil
+}
+
+//HealthCheck health check
+func HealthCheck() map[string]string {
+	return healthStatus
 }

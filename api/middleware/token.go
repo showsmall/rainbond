@@ -20,7 +20,6 @@ package middleware
 
 import (
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -28,8 +27,6 @@ import (
 
 	"github.com/goodrain/rainbond/api/handler"
 	"github.com/goodrain/rainbond/api/util"
-
-	"github.com/Sirupsen/logrus"
 )
 
 //Token 简单token验证
@@ -44,7 +41,6 @@ func Token(next http.Handler) http.Handler {
 			}
 			auths := strings.SplitN(auth, " ", 2)
 			if len(auths) != 2 {
-				fmt.Println("error")
 				return
 			}
 			authMethod := auths[0]
@@ -101,7 +97,6 @@ func FullToken(next http.Handler) http.Handler {
 			}
 			auths := strings.SplitN(auth, " ", 2)
 			if len(auths) != 2 {
-				fmt.Println("error")
 				return
 			}
 			authMethod := auths[0]
@@ -142,36 +137,6 @@ func FullToken(next http.Handler) http.Handler {
 		}
 		util.CloseRequest(r)
 		w.WriteHeader(http.StatusUnauthorized)
-	}
-	return http.HandlerFunc(fn)
-}
-
-//License license验证
-func License(next http.Handler) http.Handler {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		licenseMap, err := handler.GetLicensesInfosHandler().ShowInfos()
-		if err != nil {
-			logrus.Errorf("Get license map error, %v", err)
-			return
-		}
-		l := r.Header.Get("License")
-		//logrus.Debugf("Request License is :" + l)
-		if l == "" {
-			logrus.Debugf("need license")
-			util.CloseRequest(r)
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		if _, ok := licenseMap[l]; !ok {
-			logrus.Debugf("have no license suit for %v", l)
-			util.CloseRequest(r)
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		logrus.Debugf("license info for %v is :%v", l, licenseMap[l])
-		//TODO: 细致校验，时间，接口
-		next.ServeHTTP(w, r)
-		return
 	}
 	return http.HandlerFunc(fn)
 }

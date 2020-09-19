@@ -22,18 +22,18 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	"github.com/goodrain/rainbond/builder"
 	"github.com/goodrain/rainbond/builder/sources"
 	"github.com/goodrain/rainbond/event"
 	"github.com/pquerna/ffjson/ffjson"
+
 	//"github.com/docker/docker/api/types"
 
 	//"github.com/docker/docker/client"
 
-	"github.com/goodrain/rainbond/builder/apiHandler"
 	"github.com/goodrain/rainbond/db"
 	dbmodel "github.com/goodrain/rainbond/db/model"
-	"github.com/goodrain/rainbond/worker/discover/model"
 )
 
 //MarketSlugItem MarketSlugItem
@@ -46,7 +46,9 @@ type MarketSlugItem struct {
 	DeployVersion string       `json:"deploy_version"`
 	TenantID      string       `json:"tenant_id"`
 	ServiceID     string       `json:"service_id"`
+	Action        string       `json:"action"`
 	TGZPath       string
+	Configs       map[string]string `json:"configs"`
 	SlugInfo      struct {
 		SlugPath    string `json:"slug_path"`
 		FTPHost     string `json:"ftp_host"`
@@ -106,26 +108,7 @@ func (i *MarketSlugItem) Run() error {
 		i.Logger.Error("更新应用版本信息失败", map[string]string{"step": "slug-share", "status": "failure"})
 		return err
 	}
-	i.Logger.Info("应用同步完成，开始启动应用", map[string]string{"step": "build-exector"})
-	if err := apiHandler.UpgradeService(i.TenantName, i.ServiceAlias, i.CreateUpgradeTaskBody()); err != nil {
-		i.Logger.Error("启动应用失败，请手动启动", map[string]string{"step": "slug-share", "status": "failure"})
-		logrus.Errorf("rolling update service error, %s", err.Error())
-		return err
-	}
-	i.Logger.Info("应用启动成功", map[string]string{"step": "build-exector"})
 	return nil
-}
-
-//CreateUpgradeTaskBody 构造消息体
-func (i *MarketSlugItem) CreateUpgradeTaskBody() *model.RollingUpgradeTaskBody {
-	return &model.RollingUpgradeTaskBody{
-		TenantID:  i.TenantID,
-		ServiceID: i.ServiceID,
-		//TODO: 区分curr version 与 new version
-		CurrentDeployVersion: i.DeployVersion,
-		NewDeployVersion:     i.DeployVersion,
-		EventID:              i.EventID,
-	}
 }
 
 //UpdateVersionInfo 更新任务执行结果
@@ -145,6 +128,9 @@ func (i *MarketSlugItem) UpdateVersionInfo(vi *dbmodel.VersionInfo) error {
 	}
 	if vi.FinalStatus != "" {
 		version.FinalStatus = vi.FinalStatus
+	}
+	if vi.DeliveredType == "slug" {
+		version.ImageName = builder.RUNNERIMAGENAME
 	}
 	if err := db.GetManager().VersionInfoDao().UpdateModel(version); err != nil {
 		return err

@@ -23,10 +23,12 @@ import (
 	"fmt"
 	"runtime/debug"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/ghodss/yaml"
+
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/builder/parser"
 	"github.com/goodrain/rainbond/event"
+	"github.com/goodrain/rainbond/mq/api/grpc/pb"
 	"github.com/pquerna/ffjson/ffjson"
 )
 
@@ -41,6 +43,8 @@ type ServiceCheckInput struct {
 	// docker-run: docker run --name xxx nginx:latest nginx
 	// docker-compose: compose全文
 	SourceBody string `json:"source_body"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
 	TenantID   string
 	EventID    string `json:"event_id"`
 }
@@ -74,13 +78,13 @@ func CreateResult(ErrorInfos parser.ParseErrorList, ServiceInfo []parser.Service
 }
 
 //serviceCheck 应用创建源检测
-func (e *exectorManager) serviceCheck(in []byte) {
+func (e *exectorManager) serviceCheck(task *pb.TaskMessage) {
 	//step1 判断应用源类型
 	//step2 获取应用源介质，镜像Or源码
 	//step3 解析判断应用源规范
 	//完成
 	var input ServiceCheckInput
-	if err := ffjson.Unmarshal(in, &input); err != nil {
+	if err := ffjson.Unmarshal(task.TaskBody, &input); err != nil {
 		logrus.Error("Unmarshal service check input data error.", err.Error())
 		return
 	}
@@ -90,29 +94,34 @@ func (e *exectorManager) serviceCheck(in []byte) {
 		if r := recover(); r != nil {
 			logrus.Errorf("service check error: %v", r)
 			debug.PrintStack()
-			logger.Error("后端服务开小差，请重试或联系客服", map[string]string{"step": "callback", "status": "failure"})
+			logger.Error("The back-end service has deserted, please try again.", map[string]string{"step": "callback", "status": "failure"})
 		}
 	}()
-	logger.Info("开始应用构建源检测", map[string]string{"step": "starting"})
+	logger.Info("Start component deploy source check.", map[string]string{"step": "starting"})
 	logrus.Infof("start check service by type: %s ", input.SourceType)
 	var pr parser.Parser
 	switch input.SourceType {
 	case "docker-run":
-		pr = parser.CreateDockerRunOrImageParse(input.SourceBody, e.DockerClient, logger)
+		pr = parser.CreateDockerRunOrImageParse(input.Username, input.Password, input.SourceBody, e.DockerClient, logger)
 	case "docker-compose":
-		logrus.Debugf("source body is \n%v", input.SourceBody)
-		y, err := yaml.JSONToYAML([]byte(input.SourceBody))
-		if err != nil {
-			logrus.Errorf("json bytes format is error, %s", input.SourceBody)
-			logger.Error("dockercompose文件格式不正确。", map[string]string{"step": "callback", "status": "failure"})
-			return
+		var yamlbody = input.SourceBody
+		if input.SourceBody[0] == '{' {
+			yamlbyte, err := yaml.JSONToYAML([]byte(input.SourceBody))
+			if err != nil {
+				logrus.Errorf("json bytes format is error, %s", input.SourceBody)
+				logger.Error("The dockercompose file is not in the correct format", map[string]string{"step": "callback", "status": "failure"})
+				return
+			}
+			yamlbody = string(yamlbyte)
 		}
-		pr = parser.CreateDockerComposeParse(string(y), e.DockerClient, logger)
+		pr = parser.CreateDockerComposeParse(yamlbody, e.DockerClient, input.Username, input.Password, logger)
 	case "sourcecode":
 		pr = parser.CreateSourceCodeParse(input.SourceBody, logger)
+	case "third-party-service":
+		pr = parser.CreateThirdPartyServiceParse(input.SourceBody, logger)
 	}
 	if pr == nil {
-		logger.Error("创建应用来源类型不支持。", map[string]string{"step": "callback", "status": "failure"})
+		logger.Error("Creating component source types is not supported", map[string]string{"step": "callback", "status": "failure"})
 		return
 	}
 	errList := pr.Parse()

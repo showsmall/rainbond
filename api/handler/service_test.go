@@ -20,14 +20,15 @@ package handler
 
 import (
 	"fmt"
+	"github.com/goodrain/rainbond/api/proxy"
+	"github.com/twinj/uuid"
 	"strings"
 	"testing"
 
 	api_model "github.com/goodrain/rainbond/api/model"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/pquerna/ffjson/ffjson"
-	uuid "github.com/satori/go.uuid"
 )
 
 func TestABCService(t *testing.T) {
@@ -94,26 +95,16 @@ func TestABCService(t *testing.T) {
 	fmt.Printf("json is \n %v", s)
 }
 
-/*
-func TestPortOuter(t *testing.T) {
-	if err := db.CreateManager(dbconfig.Config{
-		MysqlConnectionInfo: "root:admin@tcp(127.0.0.1:3306)/region",
-		DBType:              "mysql",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	sa := &ServiceAction{}
-	port, sche, err := sa.PortOuter("123", "257389e878258717abc6fa7c98660709", "close", 8080)
-	t.Log(port)
-	t.Log(sche)
-	t.Log(err)
-}
-*/
-
 func TestUUID(t *testing.T) {
 	id := fmt.Sprintf("%s", uuid.NewV4())
 	uid := strings.Replace(id, "-", "", -1)
 	logrus.Debugf("uuid is %v", uid)
 	name := strings.Split(id, "-")[0]
 	fmt.Printf("id is %s, uid is %s, name is %v", id, uid, name)
+}
+
+func TestGetServicesDisk(t *testing.T) {
+	p := proxy.CreateProxy("prometheus", "http", []string{"39.96.189.166:9999"})
+	disk := GetServicesDisk([]string{"ef75e1d5e3df412a8af06129dae42869"}, p)
+	t.Log(disk)
 }

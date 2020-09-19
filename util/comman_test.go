@@ -21,7 +21,9 @@ package util
 import (
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenOrCreateFile(t *testing.T) {
@@ -81,4 +83,42 @@ func TestMergeDir(t *testing.T) {
 	if err := MergeDir("/tmp/ctr-944254844/", "/tmp/cache"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCreateHostID(t *testing.T) {
+	uid, err := CreateHostID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(uid)
+}
+
+func TestGetCurrentDir(t *testing.T) {
+	t.Log(GetCurrentDir())
+}
+
+func TestCopyFile(t *testing.T) {
+	if err := CopyFile("/tmp/test2.zip", "/tmp/test4.zip"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseVariable(t *testing.T) {
+	configs := make(map[string]string, 0)
+	result := ParseVariable("sada${XXX:aaa}dasd${XXX:aaa} ${YYY:aaa} ASDASD ${ZZZ:aaa}", configs)
+	t.Log(result)
+
+	t.Log(ParseVariable("sada${XXX:aaa}dasd${XXX:aaa} ${YYY:aaa} ASDASD ${ZZZ:aaa}", map[string]string{
+		"XXX": "123DDD",
+		"ZZZ": ",.,.,.,.",
+	}))
+}
+
+func TestTimeFormat(t *testing.T) {
+	tt := "2019-08-24 11:11:30.165753932 +0800 CST m=+55557.682499470"
+	timeF, err := time.Parse(time.RFC3339, strings.Replace(tt[0:19]+"+08:00", " ", "T", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(timeF.Format(time.RFC3339))
 }

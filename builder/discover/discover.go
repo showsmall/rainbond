@@ -20,64 +20,84 @@ package discover
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/goodrain/rainbond/cmd/builder/option"
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/builder/exector"
-	"github.com/goodrain/rainbond/mq/api/grpc/client"
+	"github.com/goodrain/rainbond/cmd/builder/option"
 	"github.com/goodrain/rainbond/mq/api/grpc/pb"
-	"github.com/Sirupsen/logrus"
+	"github.com/goodrain/rainbond/mq/client"
 	grpc1 "google.golang.org/grpc"
-
 )
 
 //WTOPIC is builder
 const WTOPIC string = "builder"
 
+var healthStatus = make(map[string]string, 1)
+
 //TaskManager task
 type TaskManager struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	config option.Config
-	client *client.MQClient
-	exec   exector.Manager
+	ctx, discoverCtx       context.Context
+	cancel, discoverCancel context.CancelFunc
+	config                 option.Config
+	client                 client.MQClient
+	exec                   exector.Manager
+	callbackChan           chan *pb.TaskMessage
 }
 
 //NewTaskManager return *TaskManager
-func NewTaskManager(c option.Config, exec exector.Manager) *TaskManager {
+func NewTaskManager(c option.Config, client client.MQClient, exec exector.Manager) *TaskManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &TaskManager{
-		ctx:    ctx,
-		cancel: cancel,
-		config: c,
-		exec:   exec,
+	discoverCtx, discoverCancel := context.WithCancel(ctx)
+	healthStatus["status"] = "health"
+	healthStatus["info"] = "builder service health"
+	callbackChan := make(chan *pb.TaskMessage, 100)
+	taskManager := &TaskManager{
+		discoverCtx:    discoverCtx,
+		discoverCancel: discoverCancel,
+		ctx:            ctx,
+		cancel:         cancel,
+		config:         c,
+		client:         client,
+		exec:           exec,
+		callbackChan:   callbackChan,
 	}
+	exec.SetReturnTaskChan(taskManager.callback)
+	return taskManager
 }
 
 //Start 启动
-func (t *TaskManager) Start() error {
-	client, err := client.NewMqClient(t.config.EtcdEndPoints, t.config.MQAPI)
-	if err != nil {
-		logrus.Errorf("new Mq client error, %v", err)
-		return err
-	}
-	t.client = client
-	go t.Do()
+func (t *TaskManager) Start(errChan chan error) error {
+	go t.Do(errChan)
 	logrus.Info("start discover success.")
 	return nil
 }
+func (t *TaskManager) callback(task *pb.TaskMessage) {
+	ctx, cancel := context.WithCancel(t.ctx)
+	defer cancel()
+	_, err := t.client.Enqueue(ctx, &pb.EnqueueRequest{
+		Topic:   client.BuilderTopic,
+		Message: task,
+	})
+	if err != nil {
+		logrus.Errorf("callback task to mq failure %s", err.Error())
+	}
+	logrus.Infof("The build controller returns an indigestible task(%s) to the messaging system", task.TaskId)
+}
 
 //Do do
-func (t *TaskManager) Do() {
+func (t *TaskManager) Do(errChan chan error) {
 	hostName, _ := os.Hostname()
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-t.discoverCtx.Done():
 			return
 		default:
-			ctx, cancel := context.WithCancel(t.ctx)
-			data, err := t.client.Dequeue(ctx, &pb.DequeueRequest{Topic: WTOPIC, ClientHost: hostName + "-builder"})
+			ctx, cancel := context.WithCancel(t.discoverCtx)
+			data, err := t.client.Dequeue(ctx, &pb.DequeueRequest{Topic: t.config.Topic, ClientHost: hostName + "-builder"})
 			cancel()
 			if err != nil {
 				if grpc1.ErrorDesc(err) == context.DeadlineExceeded.Error() {
@@ -86,22 +106,26 @@ func (t *TaskManager) Do() {
 				}
 				if grpc1.ErrorDesc(err) == "context canceled" {
 					logrus.Warn("grpc dequeue context canceled")
+					healthStatus["status"] = "unusual"
+					healthStatus["info"] = "grpc dequeue context canceled"
 					return
 				}
 				if grpc1.ErrorDesc(err) == "context timeout" {
 					logrus.Warn(err.Error())
 					continue
 				}
-				logrus.Error(err.Error())
+				if strings.Contains(err.Error(), "there is no connection available") {
+					errChan <- fmt.Errorf("message dequeue failure %s", err.Error())
+					return
+				}
+				logrus.Errorf("message dequeue failure %s, will retry", err.Error())
 				time.Sleep(time.Second * 2)
 				continue
 			}
-			logrus.Debugf("Receive a task: %s", data.String())
 			err = t.exec.AddTask(data)
 			if err != nil {
+				t.callbackChan <- data
 				logrus.Error("add task error:", err.Error())
-				//TODO:
-				//速率控制
 			}
 		}
 	}
@@ -109,10 +133,23 @@ func (t *TaskManager) Do() {
 
 //Stop 停止
 func (t *TaskManager) Stop() error {
+	t.discoverCancel()
+	if err := t.exec.Stop(); err != nil {
+		logrus.Errorf("stop task exec manager failure %s", err.Error())
+	}
+	for len(t.callbackChan) > 0 {
+		logrus.Infof("waiting callback chan empty")
+		time.Sleep(time.Second * 2)
+	}
 	logrus.Info("discover manager is stoping.")
 	t.cancel()
 	if t.client != nil {
 		t.client.Close()
 	}
 	return nil
+}
+
+// HealthCheck 组件的健康检查
+func HealthCheck() map[string]string {
+	return healthStatus
 }

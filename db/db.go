@@ -20,24 +20,27 @@ package db
 
 import (
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/goodrain/rainbond/db/config"
 	"github.com/goodrain/rainbond/db/dao"
 	"github.com/goodrain/rainbond/db/mysql"
-
 	"github.com/jinzhu/gorm"
+	"github.com/sirupsen/logrus"
 )
 
 //Manager db manager
 type Manager interface {
 	CloseManager() error
 	Begin() *gorm.DB
+	EnsureEndTransactionFunc() func(tx *gorm.DB)
+	VolumeTypeDao() dao.VolumeTypeDao
 	LicenseDao() dao.LicenseDao
 	AppDao() dao.AppDao
+	EnterpriseDao() dao.EnterpriseDao
 	TenantDao() dao.TenantDao
 	TenantDaoTransactions(db *gorm.DB) dao.TenantDao
-	EventLogDao() dao.EventLogDao
-	EventLogDaoTransactions(*gorm.DB) dao.EventLogDao
 	TenantServiceDao() dao.TenantServiceDao
 	TenantServiceDeleteDao() dao.TenantServiceDeleteDao
 	TenantServiceDaoTransactions(db *gorm.DB) dao.TenantServiceDao
@@ -52,19 +55,14 @@ type Manager interface {
 	TenantServiceMountRelationDaoTransactions(db *gorm.DB) dao.TenantServiceMountRelationDao
 	TenantServiceVolumeDao() dao.TenantServiceVolumeDao
 	TenantServiceVolumeDaoTransactions(*gorm.DB) dao.TenantServiceVolumeDao
-	K8sServiceDao() dao.K8sServiceDao
-	K8sServiceDaoTransactions(*gorm.DB) dao.K8sServiceDao
-	K8sDeployReplicationDao() dao.K8sDeployReplicationDao
-	K8sPodDao() dao.K8sPodDao
-	K8sPodDaoTransactions(*gorm.DB) dao.K8sPodDao
+	TenantServiceConfigFileDao() dao.TenantServiceConfigFileDao
+	TenantServiceConfigFileDaoTransactions(*gorm.DB) dao.TenantServiceConfigFileDao
 	ServiceProbeDao() dao.ServiceProbeDao
 	ServiceProbeDaoTransactions(*gorm.DB) dao.ServiceProbeDao
 	TenantServiceLBMappingPortDao() dao.TenantServiceLBMappingPortDao
 	TenantServiceLBMappingPortDaoTransactions(*gorm.DB) dao.TenantServiceLBMappingPortDao
 	TenantServiceLabelDao() dao.TenantServiceLabelDao
 	TenantServiceLabelDaoTransactions(db *gorm.DB) dao.TenantServiceLabelDao
-	TenantServiceStatusDao() dao.ServiceStatusDao
-	TenantServiceStatusDaoTransactions(db *gorm.DB) dao.ServiceStatusDao
 	LocalSchedulerDao() dao.LocalSchedulerDao
 	TenantPluginDaoTransactions(db *gorm.DB) dao.TenantPluginDao
 	TenantPluginDao() dao.TenantPluginDao
@@ -74,6 +72,8 @@ type Manager interface {
 	TenantPluginBuildVersionDaoTransactions(db *gorm.DB) dao.TenantPluginBuildVersionDao
 	TenantPluginVersionENVDao() dao.TenantPluginVersionEnvDao
 	TenantPluginVersionENVDaoTransactions(db *gorm.DB) dao.TenantPluginVersionEnvDao
+	TenantPluginVersionConfigDao() dao.TenantPluginVersionConfigDao
+	TenantPluginVersionConfigDaoTransactions(db *gorm.DB) dao.TenantPluginVersionConfigDao
 	TenantServicePluginRelationDao() dao.TenantServicePluginRelationDao
 	TenantServicePluginRelationDaoTransactions(db *gorm.DB) dao.TenantServicePluginRelationDao
 	TenantServicesStreamPluginPortDao() dao.TenantServicesStreamPluginPortDao
@@ -81,9 +81,6 @@ type Manager interface {
 
 	CodeCheckResultDao() dao.CodeCheckResultDao
 	CodeCheckResultDaoTransactions(db *gorm.DB) dao.CodeCheckResultDao
-
-	AppPublishDao() dao.AppPublishDao
-	AppPublishDaoTransactions(db *gorm.DB) dao.AppPublishDao
 
 	ServiceEventDao() dao.EventDao
 	ServiceEventDaoTransactions(db *gorm.DB) dao.EventDao
@@ -98,25 +95,74 @@ type Manager interface {
 	RegionAPIClassDaoTransactions(db *gorm.DB) dao.RegionAPIClassDao
 
 	RegionProcotolsDao() dao.RegionProcotolsDao
+	RegionProcotolsDaoTransactions(db *gorm.DB) dao.RegionProcotolsDao
 
 	NotificationEventDao() dao.NotificationEventDao
 	AppBackupDao() dao.AppBackupDao
+	AppBackupDaoTransactions(db *gorm.DB) dao.AppBackupDao
+	ServiceSourceDao() dao.ServiceSourceDao
+
+	// gateway
+	CertificateDao() dao.CertificateDao
+	CertificateDaoTransactions(db *gorm.DB) dao.CertificateDao
+	RuleExtensionDao() dao.RuleExtensionDao
+	RuleExtensionDaoTransactions(db *gorm.DB) dao.RuleExtensionDao
+	HTTPRuleDao() dao.HTTPRuleDao
+	HTTPRuleDaoTransactions(db *gorm.DB) dao.HTTPRuleDao
+	TCPRuleDao() dao.TCPRuleDao
+	TCPRuleDaoTransactions(db *gorm.DB) dao.TCPRuleDao
+	GwRuleConfigDao() dao.GwRuleConfigDao
+	GwRuleConfigDaoTransactions(db *gorm.DB) dao.GwRuleConfigDao
+
+	// third-party service
+	EndpointsDao() dao.EndpointsDao
+	EndpointsDaoTransactions(db *gorm.DB) dao.EndpointsDao
+	ThirdPartySvcDiscoveryCfgDao() dao.ThirdPartySvcDiscoveryCfgDao
+	ThirdPartySvcDiscoveryCfgDaoTransactions(db *gorm.DB) dao.ThirdPartySvcDiscoveryCfgDao
+
+	TenantServceAutoscalerRulesDao() dao.TenantServceAutoscalerRulesDao
+	TenantServceAutoscalerRulesDaoTransactions(db *gorm.DB) dao.TenantServceAutoscalerRulesDao
+	TenantServceAutoscalerRuleMetricsDao() dao.TenantServceAutoscalerRuleMetricsDao
+	TenantServceAutoscalerRuleMetricsDaoTransactions(db *gorm.DB) dao.TenantServceAutoscalerRuleMetricsDao
+	TenantServiceScalingRecordsDao() dao.TenantServiceScalingRecordsDao
+	TenantServiceScalingRecordsDaoTransactions(db *gorm.DB) dao.TenantServiceScalingRecordsDao
+
+	TenantServiceMonitorDao() dao.TenantServiceMonitorDao
+	TenantServiceMonitorDaoTransactions(db *gorm.DB) dao.TenantServiceMonitorDao
 }
 
 var defaultManager Manager
 
+var supportDrivers map[string]struct{}
+
+func init() {
+	supportDrivers = map[string]struct{}{
+		"mysql":       {},
+		"cockroachdb": {},
+	}
+}
+
 //CreateManager 创建manager
 func CreateManager(config config.Config) (err error) {
-	if config.DBType == "mysql" || config.DBType == "cockroachdb" {
-		defaultManager, err = mysql.CreateManager(config)
-	} else {
-		//TODO:etcd 插件实现
-		//defaultManager, err = etcd.CreateManager(config)
+	if _, ok := supportDrivers[config.DBType]; !ok {
+		return fmt.Errorf("DB drivers: %s not supported", config.DBType)
 	}
+
+	for {
+		defaultManager, err = mysql.CreateManager(config)
+		if err == nil {
+			logrus.Infof("db manager is ready")
+			break
+		}
+		logrus.Errorf("get db manager failed, try time is %d,%s", 10, err.Error())
+		time.Sleep(10 * time.Second)
+	}
+	//TODO:etcd db plugin
+	//defaultManager, err = etcd.CreateManager(config)
 	return
 }
 
-//CloseManager 关闭
+//CloseManager close db manager
 func CloseManager() error {
 	if defaultManager == nil {
 		return errors.New("default db manager not init")
@@ -124,7 +170,12 @@ func CloseManager() error {
 	return defaultManager.CloseManager()
 }
 
-//GetManager 获取管理器
+//GetManager get db manager
 func GetManager() Manager {
 	return defaultManager
+}
+
+// SetTestManager sets the default manager for unit test
+func SetTestManager(m Manager) {
+	defaultManager = m
 }

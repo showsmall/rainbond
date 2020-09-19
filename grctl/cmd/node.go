@@ -19,9 +19,7 @@
 package cmd
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -29,55 +27,41 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/apcera/termtables"
+	"github.com/goodrain/rainbond/util/ansible"
+
+	"github.com/fatih/color"
+
+	"github.com/sirupsen/logrus"
+	"github.com/goodrain/rainbond/util/termtables"
 	"github.com/goodrain/rainbond/api/util"
 	"github.com/goodrain/rainbond/grctl/clients"
-	"github.com/goodrain/rainbond/node/api/model"
+	"github.com/goodrain/rainbond/node/nodem/client"
+	coreutil "github.com/goodrain/rainbond/util"
+	"github.com/gosuri/uitable"
 	"github.com/urfave/cli"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 )
 
 func handleErr(err *util.APIHandleError) {
-	if err != nil && err.Err != nil {
-		fmt.Printf("%v\n", err.String())
-		os.Exit(1)
+	if err != nil {
+		if err.Err != nil {
+			fmt.Printf(err.String())
+			os.Exit(1)
+		} else {
+			fmt.Printf("API return %d", err.Code)
+		}
 	}
 }
-func NewCmdShow() cli.Command {
-	c := cli.Command{
-		Name:  "show",
-		Usage: "显示region安装完成后访问地址",
-		Action: func(c *cli.Context) error {
-			manageHosts, err := clients.NodeClient.Nodes().Rule("manage")
-			handleErr(err)
-			ips := getExternalIP("/etc/goodrain/envs/.exip", manageHosts)
-			fmt.Println("Manage your apps with webui：")
-			for _, v := range ips {
-				url := v + ":7070"
-				fmt.Print(url + "  ")
-			}
-			fmt.Println()
-			fmt.Println("The webui use websocket to provide more feture：")
-			for _, v := range ips {
-				url := v + ":6060"
-				fmt.Print(url + "  ")
-			}
-			fmt.Println()
-			fmt.Println("Your web apps use nginx for reverse proxy:")
-			for _, v := range ips {
-				url := v + ":80"
-				fmt.Print(url + "  ")
-			}
-			fmt.Println()
-			return nil
-		},
-	}
-	return c
+func showError(m string) {
+	fmt.Printf("Error: %s\n", m)
+	os.Exit(1)
 }
 
-func getExternalIP(path string, node []*model.HostNode) []string {
+func showSuccessMsg(m string) {
+	fmt.Printf("Success: %s\n", m)
+	os.Exit(0)
+}
+
+func getExternalIP(path string, node []*client.HostNode) []string {
 	var result []string
 	if fileExist(path) {
 		externalIP, err := ioutil.ReadFile(path)
@@ -103,51 +87,159 @@ func fileExist(path string) bool {
 	}
 	return false
 }
-func handleStatus(serviceTable *termtables.Table, ready bool, v *model.HostNode) {
-	if v.Role.HasRule("compute") && !v.Role.HasRule("manage") {
-		serviceTable.AddRow(v.ID, v.InternalIP, v.HostName, v.Role.String(), v.Mode, v.Status, v.Alived, !v.Unschedulable, ready)
-	} else if v.Role.HasRule("manage") && !v.Role.HasRule("compute") {
-		//scheduable="n/a"
-		serviceTable.AddRow(v.ID, v.InternalIP, v.HostName, v.Role.String(), v.Mode, v.Status, v.Alived, "N/A", "N/A")
-	} else if v.Role.HasRule("compute") && v.Role.HasRule("manage") {
-		serviceTable.AddRow(v.ID, v.InternalIP, v.HostName, v.Role.String(), v.Mode, v.Status, v.Alived, !v.Unschedulable, ready)
+
+type nodeStatusShow struct {
+	status  string
+	message []string
+	color   color.Attribute
+}
+
+func (n nodeStatusShow) String() string {
+	color := color.New(n.color)
+	if len(n.message) > 0 {
+		return color.Sprintf("%s(%s)", n.status, strings.Join(n.message, ","))
 	}
+	return color.Sprintf("%s", n.status)
+}
+func getStatusShow(v *client.HostNode) (status string) {
+	nss := nodeStatusShow{
+		status: v.Status,
+		color:  color.FgGreen,
+	}
+	if v.Role.HasRule("compute") && !v.NodeStatus.CurrentScheduleStatus {
+		nss.message = append(nss.message, "unschedulable")
+		nss.color = color.FgYellow
+	}
+	if !v.NodeStatus.NodeHealth {
+		nss.message = append(nss.message, "unhealth")
+		nss.color = color.FgRed
+	}
+	if v.NodeStatus.Status == client.Offline {
+		nss.message = append(nss.message, client.Offline)
+		nss.color = color.FgRed
+	}
+
+	result := nss.String()
+	if strings.Contains(result, "unknown") {
+		result = "unknown"
+	}
+	return result
+}
+func handleStatus(serviceTable *termtables.Table, v *client.HostNode) {
+	serviceTable.AddRow(v.ID, v.InternalIP, v.HostName, v.Role.String(), getStatusShow(v))
+}
+
+func handleConditionResult(serviceTable *termtables.Table, conditions []client.NodeCondition) {
+	for _, v := range conditions {
+		if v.Type == client.NodeReady {
+			continue
+		}
+		var formatReady string
+		if v.Status == client.ConditionFalse || v.Status == client.ConditionUnknown {
+			if v.Type == client.OutOfDisk || v.Type == client.MemoryPressure || v.Type == client.DiskPressure || v.Type == client.InstallNotReady {
+				formatReady = "\033[0;32;32m false \033[0m"
+			} else {
+				formatReady = fmt.Sprintf("\033[0;31;31m %s \033[0m", v.Status)
+			}
+		} else {
+			if v.Type == client.OutOfDisk || v.Type == client.MemoryPressure || v.Type == client.DiskPressure || v.Type == client.InstallNotReady {
+				formatReady = "\033[0;31;31m true \033[0m"
+			} else {
+				formatReady = "\033[0;32;32m true \033[0m"
+			}
+		}
+		serviceTable.AddRow(string(v.Type), formatReady,
+			v.LastHeartbeatTime.Format(time.RFC3339)[:19],
+			v.LastTransitionTime.Format(time.RFC3339)[:19],
+			handleMessage(string(v.Status), v.Message),
+		)
+	}
+}
+
+func extractReady(serviceTable *termtables.Table, conditions []client.NodeCondition, name string) {
+	for _, v := range conditions {
+		if string(v.Type) == name {
+			var formatReady string
+			if v.Status == client.ConditionFalse {
+				formatReady = "\033[0;31;31m false \033[0m"
+			} else {
+				formatReady = "\033[0;32;32m true \033[0m"
+			}
+			serviceTable.AddRow("\033[0;33;33m "+string(v.Type)+" \033[0m", formatReady,
+				v.LastHeartbeatTime.Format(time.RFC3339)[:19],
+				v.LastTransitionTime.Format(time.RFC3339)[:19],
+				handleMessage(string(v.Status), v.Message))
+		}
+	}
+}
+
+func handleMessage(status string, message string) string {
+	if status == "True" {
+		return ""
+	}
+	return message
 }
 
 //NewCmdNode NewCmdNode
 func NewCmdNode() cli.Command {
 	c := cli.Command{
 		Name:  "node",
-		Usage: "节点。grctl node",
+		Usage: "rainbond node manage cmd",
 		Subcommands: []cli.Command{
 			{
 				Name:  "get",
 				Usage: "get hostID/internal ip",
+				Flags: []cli.Flag{
+					cli.StringFlag{
+						Name: "output,o",
+					},
+				},
 				Action: func(c *cli.Context) error {
+					Common(c)
 					id := c.Args().First()
 					if id == "" {
 						logrus.Errorf("need args")
 						return nil
 					}
-
-					nodes, err := clients.NodeClient.Nodes().List()
+					v, err := clients.RegionClient.Nodes().Get(id)
 					handleErr(err)
-					for _, v := range nodes {
-						if v.InternalIP == id {
-							id = v.ID
-							break
-						}
+					if c.String("output") == "json" {
+						jsIndent, _ := json.MarshalIndent(v, "", "\t")
+						fmt.Print(string(jsIndent))
+						os.Exit(0)
 					}
-
-					v, err := clients.NodeClient.Nodes().Get(id)
-					handleErr(err)
-					nodeByte, _ := json.Marshal(v)
-					var out bytes.Buffer
-					error := json.Indent(&out, nodeByte, "", "\t")
-					if error != nil {
-						handleErr(util.CreateAPIHandleError(500, err))
+					table := uitable.New()
+					fmt.Printf("-------------------Node Information-----------------------\n")
+					table.AddRow("uuid", v.ID)
+					table.AddRow("host_name", v.HostName)
+					table.AddRow("health", v.NodeStatus.NodeHealth)
+					table.AddRow("create_time", v.CreateTime)
+					table.AddRow("internal_ip", v.InternalIP)
+					table.AddRow("external_ip", v.ExternalIP)
+					table.AddRow("role", v.Role)
+					table.AddRow("mode", v.Mode)
+					table.AddRow("available_memory", fmt.Sprintf("%d GB", v.AvailableMemory/1024/1024/1024))
+					table.AddRow("available_cpu", fmt.Sprintf("%d Core", v.AvailableCPU))
+					table.AddRow("status", v.Status)
+					table.AddRow("schedulable(set)", !v.Unschedulable)
+					table.AddRow("schedulable(current)", v.NodeStatus.CurrentScheduleStatus)
+					table.AddRow("version", v.NodeStatus.Version)
+					table.AddRow("up", v.NodeStatus.NodeUpdateTime)
+					table.AddRow("last_down_time", v.NodeStatus.LastDownTime)
+					fmt.Println(table)
+					fmt.Printf("-------------------Node Labels-----------------------\n")
+					labeltable := uitable.New()
+					// TODO: distinguish system labels and custom labels
+					for k, v := range v.Labels {
+						labeltable.AddRow(k, v)
 					}
-					fmt.Println(out.String())
+					fmt.Println(labeltable)
+					fmt.Printf("-------------------Service health-----------------------\n")
+					serviceTable := termtables.CreateTable()
+					serviceTable.AddHeaders("Condition", "Health", "LastUpdateTime", "LastChangeTime", "Message")
+					extractReady(serviceTable, v.NodeStatus.Conditions, "Ready")
+					handleConditionResult(serviceTable, v.NodeStatus.Conditions)
+					fmt.Println(serviceTable.Render())
 					return nil
 				},
 			},
@@ -155,14 +247,15 @@ func NewCmdNode() cli.Command {
 				Name:  "list",
 				Usage: "list",
 				Action: func(c *cli.Context) error {
-					list, err := clients.NodeClient.Nodes().List()
+					Common(c)
+					list, err := clients.RegionClient.Nodes().List()
 					handleErr(err)
 					serviceTable := termtables.CreateTable()
-					serviceTable.AddHeaders("Uid", "IP", "HostName", "NodeRole", "NodeMode", "Status", "Alived", "Schedulable", "Ready")
-					var rest []*model.HostNode
+					serviceTable.AddHeaders("Uid", "IP", "HostName", "NodeRole", "Status")
+					var rest []*client.HostNode
 					for _, v := range list {
 						if v.Role.HasRule("manage") {
-							handleStatus(serviceTable, isNodeReady(v), v)
+							handleStatus(serviceTable, v)
 						} else {
 							rest = append(rest, v)
 						}
@@ -171,77 +264,111 @@ func NewCmdNode() cli.Command {
 						serviceTable.AddSeparator()
 					}
 					for _, v := range rest {
-						handleStatus(serviceTable, isNodeReady(v), v)
+						handleStatus(serviceTable, v)
 					}
 					fmt.Println(serviceTable.Render())
 					return nil
 				},
 			},
 			{
-				Name:  "up",
-				Usage: "up hostID",
+				Name:  "resource",
+				Usage: "resource",
 				Action: func(c *cli.Context) error {
-					id := c.Args().First()
-					if id == "" {
-						logrus.Errorf("need hostID")
-						return nil
-					}
-					err := clients.NodeClient.Nodes().Up(id)
+					Common(c)
+					list, err := clients.RegionClient.Nodes().List()
 					handleErr(err)
+					serviceTable := termtables.CreateTable()
+					serviceTable.AddHeaders("Uid", "HostName", "CapCpu(核)", "CapMemory(M)", "UsedCpu(核)", "UsedMemory(M)", "CpuLimits(核)", "MemoryLimits(M)", "CpuUsageRate(%)", "MemoryUsedRate(%)")
+					for _, v := range list {
+						if v.Role.HasRule("compute") && v.Status != "offline" {
+							nodeResource, err := clients.RegionClient.Nodes().GetNodeResource(v.ID)
+							handleErr(err)
+							CPURequests := strconv.FormatFloat(float64(nodeResource.CPURequests)/float64(1000), 'f', 2, 64)
+							CPULimits := strconv.FormatFloat(float64(nodeResource.CPULimits)/float64(1000), 'f', 2, 64)
+							serviceTable.AddRow(v.ID, v.HostName, nodeResource.CPU, nodeResource.MemR, CPURequests,
+								nodeResource.MemoryRequests, CPULimits,
+								nodeResource.MemoryLimits,
+								nodeResource.CPURequestsR,
+								nodeResource.MemoryRequestsR)
+						}
+					}
+					fmt.Println(serviceTable.Render())
 					return nil
 				},
 			},
+			// {
+			// 	Name:  "up",
+			// 	Usage: "up hostID",
+			// 	Action: func(c *cli.Context) error {
+			// 		Common(c)
+			// 		id := c.Args().First()
+			// 		if id == "" {
+			// 			logrus.Errorf("need hostID")
+			// 			return nil
+			// 		}
+			// 		err := clients.RegionClient.Nodes().Up(id)
+			// 		handleErr(err)
+			// 		fmt.Printf("up node %s  success\n", id)
+			// 		return nil
+			// 	},
+			// },
+			// {
+			// 	Name:  "down",
+			// 	Usage: "down hostID",
+			// 	Action: func(c *cli.Context) error {
+			// 		Common(c)
+			// 		id := c.Args().First()
+			// 		if id == "" {
+			// 			logrus.Errorf("need hostID")
+			// 			return nil
+			// 		}
+			// 		err := clients.RegionClient.Nodes().Down(id)
+			// 		handleErr(err)
+			// 		fmt.Printf("down node %s  success\n", id)
+			// 		return nil
+			// 	},
+			// },
 			{
-				Name:  "down",
-				Usage: "down hostID",
+				Name:  "cordon",
+				Usage: "Mark node as unschedulable",
 				Action: func(c *cli.Context) error {
+					Common(c)
 					id := c.Args().First()
 					if id == "" {
 						logrus.Errorf("need hostID")
 						return nil
 					}
-					err := clients.NodeClient.Nodes().Down(id)
-					handleErr(err)
-					return nil
-				},
-			},
-			{
-				Name:  "unscheduable",
-				Usage: "unscheduable hostID",
-				Action: func(c *cli.Context) error {
-					id := c.Args().First()
-					if id == "" {
-						logrus.Errorf("need hostID")
-						return nil
-					}
-					node, err := clients.NodeClient.Nodes().Get(id)
+					node, err := clients.RegionClient.Nodes().Get(id)
 					handleErr(err)
 					if !node.Role.HasRule("compute") {
 						logrus.Errorf("管理节点不支持此功能")
 						return nil
 					}
-					err = clients.NodeClient.Nodes().UnSchedulable(id)
+					err = clients.RegionClient.Nodes().UnSchedulable(id)
 					handleErr(err)
+					fmt.Printf("cordon node %s  success\n", id)
 					return nil
 				},
 			},
 			{
-				Name:  "rescheduable",
-				Usage: "rescheduable hostID",
+				Name:  "uncordon",
+				Usage: "Mark node as schedulable",
 				Action: func(c *cli.Context) error {
+					Common(c)
 					id := c.Args().First()
 					if id == "" {
 						logrus.Errorf("need hostID")
 						return nil
 					}
-					node, err := clients.NodeClient.Nodes().Get(id)
+					node, err := clients.RegionClient.Nodes().Get(id)
 					handleErr(err)
 					if !node.Role.HasRule("compute") {
 						logrus.Errorf("管理节点不支持此功能")
 						return nil
 					}
-					err = clients.NodeClient.Nodes().ReSchedulable(id)
+					err = clients.RegionClient.Nodes().ReSchedulable(id)
 					handleErr(err)
+					fmt.Printf("uncordon node %s  success\n", id)
 					return nil
 				},
 			},
@@ -249,13 +376,15 @@ func NewCmdNode() cli.Command {
 				Name:  "delete",
 				Usage: "delete hostID",
 				Action: func(c *cli.Context) error {
+					Common(c)
 					id := c.Args().First()
 					if id == "" {
 						logrus.Errorf("need hostID")
 						return nil
 					}
-					err := clients.NodeClient.Nodes().Delete(id)
+					err := clients.RegionClient.Nodes().Delete(id)
 					handleErr(err)
+					fmt.Printf("delete node %s  success\n", id)
 					return nil
 				},
 			},
@@ -263,226 +392,216 @@ func NewCmdNode() cli.Command {
 				Name:  "rule",
 				Usage: "rule ruleName",
 				Action: func(c *cli.Context) error {
+					Common(c)
 					rule := c.Args().First()
 					if rule == "" {
 						logrus.Errorf("need rule name")
 						return nil
 					}
-					hostnodes, err := clients.NodeClient.Nodes().Rule(rule)
+					hostnodes, err := clients.RegionClient.Nodes().GetNodeByRule(rule)
 					handleErr(err)
 					serviceTable := termtables.CreateTable()
-					serviceTable.AddHeaders("Uid", "IP", "HostName", "NodeRole", "NodeMode", "Alived", "Schedulable", "Ready")
+					serviceTable.AddHeaders("Uid", "IP", "HostName", "NodeRole", "Status")
 					for _, v := range hostnodes {
-
-						var ready bool = false
-						if v.NodeStatus != nil {
-							ready = true
-						}
-						handleStatus(serviceTable, ready, v)
-
+						handleStatus(serviceTable, v)
 					}
 					return nil
 				},
 			},
 			{
 				Name:  "label",
-				Usage: "label hostID",
-				Flags: []cli.Flag{
-					cli.StringFlag{
-						Name:  "key",
-						Value: "",
-						Usage: "key",
+				Usage: "handle node labels",
+				Subcommands: []cli.Command{
+					cli.Command{
+						Name:  "add",
+						Usage: "add label for the specified node",
+						Flags: []cli.Flag{
+							cli.StringFlag{
+								Name:  "key",
+								Value: "",
+								Usage: "the label key",
+							},
+							cli.StringFlag{
+								Name:  "val",
+								Value: "",
+								Usage: "the label val",
+							},
+						},
+						Action: func(c *cli.Context) error {
+							Common(c)
+							hostID := c.Args().First()
+							if hostID == "" {
+								logrus.Errorf("need hostID")
+								return nil
+							}
+							k := c.String("key")
+							v := c.String("val")
+							if k == "" || v == "" {
+								logrus.Errorf("label key or value can not be empty")
+								return nil
+							}
+							err := clients.RegionClient.Nodes().Label(hostID).Add(k, v)
+							handleErr(err)
+							return nil
+						},
 					},
-					cli.StringFlag{
-						Name:  "val",
-						Value: "",
-						Usage: "val",
+					cli.Command{
+						Name:  "delete",
+						Usage: "delete the label of the specified node",
+						Flags: []cli.Flag{
+							cli.StringFlag{
+								Name:  "key",
+								Value: "",
+								Usage: "the label key",
+							},
+						},
+						Action: func(c *cli.Context) error {
+							Common(c)
+							hostID := c.Args().First()
+							if hostID == "" {
+								logrus.Errorf("need hostID")
+								return nil
+							}
+							k := c.String("key")
+							err := clients.RegionClient.Nodes().Label(hostID).Delete(k)
+							handleErr(err)
+							return nil
+						},
 					},
-				},
-				Action: func(c *cli.Context) error {
-					hostID := c.Args().First()
-					if hostID == "" {
-						logrus.Errorf("need hostID")
-						return nil
-					}
-					k := c.String("key")
-					v := c.String("val")
-					label := make(map[string]string)
-					label[k] = v
-					err := clients.NodeClient.Nodes().Label(hostID, label)
-					handleErr(err)
-					return nil
+					cli.Command{
+						Name:   "list",
+						Usage:  "list the label of the specified node",
+						Flags:  []cli.Flag{},
+						Action: listNodeLabelsCommand,
+					},
 				},
 			},
 			{
-				Name:  "add",
-				Usage: "add 添加节点",
-				Flags: []cli.Flag{
-					cli.StringFlag{
-						Name:  "Hostname,hn",
-						Value: "",
-						Usage: "Hostname",
-					},
-					cli.StringFlag{
-						Name:  "InternalIP,i",
-						Value: "",
-						Usage: "InternalIP|required",
-					},
-					cli.StringFlag{
-						Name:  "ExternalIP,e",
-						Value: "",
-						Usage: "ExternalIP",
-					},
-					cli.StringFlag{
-						Name:  "RootPass,p",
-						Value: "",
-						Usage: "RootPass",
-					},
-					cli.StringFlag{
-						Name:  "Role,ro",
-						Usage: "Role|required",
-					},
-				},
-				Action: func(c *cli.Context) error {
-					var node model.APIHostNode
-					if c.IsSet("Role") {
-						node.Role = append(node.Role, c.String("Role"))
-						node.InternalIP = c.String("InternalIP")
-						node.HostName = c.String("HostName")
-						node.ExternalIP = c.String("ExternalIP")
-						node.RootPass = c.String("RootPass")
-
-						err := clients.NodeClient.Nodes().Add(&node)
-						handleErr(err)
-						fmt.Println("开始初始化节点")
-
-						var hostNode *model.HostNode
-						timer := time.NewTimer(15 * time.Second)
-						gotNode := false
-						for !gotNode {
-							time.Sleep(3 * time.Second)
-							list, err := clients.NodeClient.Nodes().List()
-							handleErr(err)
-							for _, v := range list {
-								if node.InternalIP == v.InternalIP {
-									hostNode = v
-									timer.Stop()
-									gotNode = true
-									//todo  初始化其它节点失败判定
-								}
-							}
-						}
-						fmt.Println("添加节点成功，正在初始化")
-						tableC := termtables.CreateTable()
-						var header []string
-						var content []string
-						for {
-							time.Sleep(3 * time.Second)
-							list, err := clients.NodeClient.Nodes().List()
-							handleErr(err)
-							select {
-							case <-timer.C:
-								fmt.Println("添加节点超时，请检查etcd")
+				Name:  "condition",
+				Usage: "handle node conditions, support delete and list",
+				Subcommands: []cli.Command{
+					cli.Command{
+						Name:  "delete",
+						Usage: "delete condition for the specified node",
+						Flags: []cli.Flag{
+							cli.StringFlag{
+								Name:  "name,n",
+								Value: "",
+								Usage: "the condition type name",
+							},
+						},
+						Action: func(c *cli.Context) error {
+							Common(c)
+							hostID := c.Args().First()
+							if hostID == "" {
+								logrus.Errorf("need hostID")
 								return nil
-							default:
-								for _, v := range list {
-									if node.InternalIP == v.InternalIP {
-										hostNode = v
-										break
-									}
-								}
-								for _, val := range hostNode.Conditions {
-									fmt.Println("正在判断节点状态，请稍等")
-									if hostNode.Alived || (val.Type == model.NodeInit && val.Status == model.ConditionTrue) {
-										fmt.Printf("节点 %s 初始化成功", hostNode.ID)
-										fmt.Println()
-										header = append(header, string(val.Type))
-										content = append(content, string(val.Status))
-										tableC.AddHeaders(header)
-										tableC.AddRow(content)
-										fmt.Println(tableC.Render())
-										return nil
-									} else if val.Type == model.NodeInit && val.Status == model.ConditionFalse {
-										fmt.Printf("节点 %s 初始化失败:%s", hostNode.ID, val.Reason)
-										return nil
-									} else {
-										fmt.Printf("..")
-									}
-								}
 							}
-						}
-
-						fmt.Println("节点初始化结束")
-						return nil
-					}
-
-					return errors.New("role must not null")
+							conditionType := c.String("name")
+							_, err := clients.RegionClient.Nodes().Condition(hostID).Delete(client.NodeConditionType(conditionType))
+							handleErr(err)
+							showSuccessMsg("delete condition success")
+							return nil
+						},
+					},
+					cli.Command{
+						Name:  "list",
+						Usage: "list the conditions of the specified node",
+						Action: func(c *cli.Context) error {
+							Common(c)
+							hostID := c.Args().First()
+							if hostID == "" {
+								logrus.Errorf("need hostID")
+								return nil
+							}
+							conditions, err := clients.RegionClient.Nodes().Condition(hostID).List()
+							handleErr(err)
+							serviceTable := termtables.CreateTable()
+							serviceTable.AddHeaders("Condition", "Health", "LastUpdateTime", "LastChangeTime", "Message")
+							handleConditionResult(serviceTable, conditions)
+							fmt.Println(serviceTable.Render())
+							return nil
+						},
+					},
 				},
 			},
+			// {
+			// 	Name:  "add",
+			// 	Usage: "Add a node into the cluster",
+			// 	Flags: []cli.Flag{
+			// 		cli.StringFlag{
+			// 			Name:  "hostname,host",
+			// 			Usage: "The option is required",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "hosts-file-path",
+			// 			Usage: "hosts file path",
+			// 			Value: "/opt/rainbond/rainbond-ansible/inventory/hosts",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "config-file-path",
+			// 			Usage: "ansible global config file path",
+			// 			Value: "/opt/rainbond/rainbond-ansible/scripts/installer/global.sh",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "internal-ip,iip",
+			// 			Usage: "The option is required",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "external-ip,eip",
+			// 			Usage: "Publish the ip address for external connection",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "root-pass,p",
+			// 			Usage: "Specify the root password of the target host for login, this option conflicts with private-key",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "private-key,key",
+			// 			Usage: "Specify the private key file for login, this option conflicts with root-pass",
+			// 		},
+			// 		cli.StringSliceFlag{
+			// 			Name:  "role,r",
+			// 			Usage: "The option is required, the allowed values are: [manage|compute|gateway]",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "podCIDR,cidr",
+			// 			Usage: "Defines the IP assignment range for the specified node, which is automatically specified if not specified",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "id",
+			// 			Usage: "Specify node ID",
+			// 		},
+			// 		cli.BoolFlag{
+			// 			Name:  "install",
+			// 			Usage: "Automatic installation after addition",
+			// 		},
+			// 	},
+			// 	Action: addNodeCommand,
+			// },
+			// {
+
+			// 	Name:  "install",
+			// 	Usage: "Install a exist node into the cluster",
+			// 	Flags: []cli.Flag{
+			// 		cli.StringFlag{
+			// 			Name:  "hosts-file-path",
+			// 			Usage: "hosts file path",
+			// 			Value: "/opt/rainbond/rainbond-ansible/inventory/hosts",
+			// 		},
+			// 		cli.StringFlag{
+			// 			Name:  "config-file-path",
+			// 			Usage: "ansible global config file path",
+			// 			Value: "/opt/rainbond/rainbond-ansible/scripts/installer/global.sh",
+			// 		},
+			// 	},
+			// 	Action: installNodeCommand,
+			// },
 		},
 	}
 	return c
 }
 
-func NewCmdNodeRes() cli.Command {
-	c := cli.Command{
-		Name:  "noderes",
-		Usage: "获取计算节点资源信息  grctl noderes",
-		Action: func(c *cli.Context) error {
-			Common(c)
-			return getNodeWithResource(c)
-		},
-	}
-	return c
-}
-
-func getNodeWithResource(c *cli.Context) error {
-	ns, err := clients.K8SClient.Core().Nodes().List(metav1.ListOptions{})
-	if err != nil {
-		logrus.Errorf("获取节点列表失败,details: %s", err.Error())
-		return err
-	}
-
-	table := termtables.CreateTable()
-	table.AddHeaders("NodeName", "Version", "CapCPU(核)", "AllocatableCPU(核)", "UsedCPU(核)", "CapMemory(M)", "AllocatableMemory(M)", "UsedMemory(M)")
-	for _, v := range ns.Items {
-
-		podList, err := clients.K8SClient.Core().Pods(metav1.NamespaceAll).List(metav1.ListOptions{FieldSelector: fields.SelectorFromSet(fields.Set{"spec.nodeName": v.Name}).String()})
-		if err != nil {
-
-		}
-		var cpuPerNode = 0
-		memPerNode := 0
-		for _, p := range podList.Items {
-			status := string(p.Status.Phase)
-
-			if status != "Running" {
-				continue
-			}
-			memPerPod := 0
-
-			memPerPod += int(p.Spec.Containers[0].Resources.Requests.Memory().Value())
-			cpuOfPod := p.Spec.Containers[0].Resources.Requests.Cpu().String()
-			if strings.Contains(cpuOfPod, "m") {
-				cpuOfPod = strings.Replace(cpuOfPod, "m", "", -1)
-			}
-			cpuI, _ := strconv.Atoi(cpuOfPod)
-			cpuPerNode += cpuI
-			memPerNode += memPerPod
-		}
-		capCPU := v.Status.Capacity.Cpu().Value()
-		capMem := v.Status.Capacity.Memory().Value()
-		allocCPU := v.Status.Allocatable.Cpu().Value()
-		allocMem := v.Status.Allocatable.Memory().Value()
-		table.AddRow(v.Name, v.Status.NodeInfo.KubeletVersion, capCPU, allocCPU, float32(cpuPerNode)/1000, capMem/1024/1024, allocMem/1024/1024, memPerNode/1024/1024)
-	}
-	fmt.Println(table.Render())
-	return nil
-}
-func isNodeReady(node *model.HostNode) bool {
-	if node.NodeStatus == nil {
-		return false
-	}
+func isNodeReady(node *client.HostNode) bool {
 	for _, v := range node.NodeStatus.Conditions {
 		if strings.ToLower(string(v.Type)) == "ready" {
 			if strings.ToLower(string(v.Status)) == "true" {
@@ -490,36 +609,128 @@ func isNodeReady(node *model.HostNode) bool {
 			}
 		}
 	}
-
 	return false
 }
-func getNode(c *cli.Context) error {
-	ns, err := clients.K8SClient.Core().Nodes().List(metav1.ListOptions{})
-	if err != nil {
-		logrus.Errorf("获取节点列表失败,details: %s", err.Error())
-		return err
-	}
-	table := termtables.CreateTable()
-	table.AddHeaders("Name", "Status", "Namespace", "Unschedulable", "KubeletVersion", "Labels")
 
-	for _, v := range ns.Items {
-		cs := v.Status.Conditions
-		status := "unknown"
-		for _, cv := range cs {
-			status = string(cv.Status)
-			if strings.Contains(status, "rue") {
-				status = string(cv.Type)
-				break
-			}
-		}
-		m := v.Labels
-		labels := ""
-		for k := range m {
-			labels += k
-			labels += " "
-		}
-		table.AddRow(v.Name, status, v.Namespace, v.Spec.Unschedulable, v.Status.NodeInfo.KubeletVersion, labels)
+func installNode(node *client.HostNode) {
+	// start add node script
+	logrus.Infof("Begin install node %s", node.ID)
+	// node stauts: installing
+	if _, err := clients.RegionClient.Nodes().UpdateNodeStatus(node.ID, client.Installing); err != nil {
+		logrus.Errorf("update node %s status failure %s", node.ID, err.Error())
 	}
-	fmt.Println(table.Render())
+	// install node
+	option := ansible.NodeInstallOption{
+		HostRole:   node.Role.String(),
+		HostName:   node.HostName,
+		InternalIP: node.InternalIP,
+		RootPass:   node.RootPass,
+		KeyPath:    node.KeyPath,
+		NodeID:     node.ID,
+		Stdin:      os.Stdin,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+	}
+
+	err := ansible.RunNodeInstallCmd(option)
+
+	if err != nil {
+		logrus.Errorf("Error executing shell script %s", err.Error())
+		if _, err := clients.RegionClient.Nodes().UpdateNodeStatus(node.ID, client.InstallFailed); err != nil {
+			logrus.Errorf("update node %s status failure %s", node.ID, err.Error())
+		}
+		return
+	}
+
+	// node status success
+	if _, err := clients.RegionClient.Nodes().UpdateNodeStatus(node.ID, client.InstallSuccess); err != nil {
+		logrus.Errorf("update node %s status failure %s", node.ID, err.Error())
+	}
+	fmt.Println("------------------------------------")
+	fmt.Printf("Install node %s successful \n", node.ID)
+	if node.Role.HasRule("compute") {
+		fmt.Printf("You can do 'grctl node up %s' to get this compute node to join the cluster workload \n", node.ID)
+	}
+}
+
+func addNodeCommand(c *cli.Context) error {
+	Common(c)
+	if !c.IsSet("role") {
+		showError("role must not null")
+	}
+	if c.String("internal-ip") == "" || !coreutil.CheckIP(c.String("internal-ip")) {
+		showError(fmt.Sprintf("internal ip(%s) is invalid", c.String("internal-ip")))
+	}
+	if c.String("root-pass") != "" && c.String("private-key") != "" {
+		showError("Options private-key and root-pass are conflicting")
+	}
+	if c.String("root-pass") == "" && c.String("private-key") == "" {
+		showError("Options private-key and root-pass must set one")
+	}
+	var node client.APIHostNode
+	role := c.StringSlice("role")
+	for _, r := range role {
+		if strings.Contains(r, ",") {
+			node.Role.Add(strings.Split(r, ",")...)
+			continue
+		}
+		node.Role.Add(r)
+	}
+	if err := node.Role.Validation(); err != nil {
+		showError(err.Error())
+	}
+	node.HostName = c.String("hostname")
+	node.RootPass = c.String("root-pass")
+	node.InternalIP = c.String("internal-ip")
+	node.ExternalIP = c.String("external-ip")
+	node.PodCIDR = c.String("podCIDR")
+	node.Privatekey = c.String("private-key")
+	node.AutoInstall = false
+	node.ID = c.String("id")
+	renode, err := clients.RegionClient.Nodes().Add(&node)
+	handleErr(err)
+	if c.Bool("install") {
+		nodes, err := clients.RegionClient.Nodes().List()
+		handleErr(err)
+		//write ansible hosts file
+		WriteHostsFile(c.String("hosts-file-path"), c.String("config-file-path"), nodes)
+		installNode(renode)
+	} else {
+		fmt.Printf("success add %s node %s \n you install it by running: grctl node install %s \n", renode.Role, renode.ID, renode.ID)
+	}
+	return nil
+}
+
+func installNodeCommand(c *cli.Context) error {
+	Common(c)
+	nodeID := c.Args().First()
+	if nodeID == "" {
+		showError("node id can not be empty")
+	}
+	node, err := clients.RegionClient.Nodes().Get(nodeID)
+	handleErr(err)
+	nodes, err := clients.RegionClient.Nodes().List()
+	handleErr(err)
+	//write ansible hosts file
+	WriteHostsFile(c.String("hosts-file-path"), c.String("config-file-path"), nodes)
+	installNode(node)
+	return nil
+}
+
+func listNodeLabelsCommand(c *cli.Context) error {
+	Common(c)
+	hostID := c.Args().First()
+	if hostID == "" {
+		logrus.Errorf("need hostID")
+		return nil
+	}
+	labels, err := clients.RegionClient.Nodes().Label(hostID).List()
+	handleErr(err)
+	labelTable := termtables.CreateTable()
+	labelTable.AddHeaders("LableKey", "LableValue")
+	for k, v := range labels {
+		labelTable.AddRow(k, v)
+	}
+	fmt.Print(labelTable.Render())
 	return nil
 }

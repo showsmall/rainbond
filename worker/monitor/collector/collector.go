@@ -19,37 +19,39 @@
 package collector
 
 import (
-	"os"
-	"strings"
-	"time"
+	"github.com/goodrain/rainbond/worker/master"
 
-	"github.com/goodrain/rainbond/db/model"
-	"github.com/goodrain/rainbond/worker/monitor/cache"
-
-	"github.com/Sirupsen/logrus"
-	status "github.com/goodrain/rainbond/appruntimesync/client"
 	"github.com/goodrain/rainbond/db"
+	"github.com/goodrain/rainbond/worker/appm/controller"
+	"github.com/goodrain/rainbond/worker/discover"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 //Exporter 收集器
 type Exporter struct {
-	dsn           string
-	error         prometheus.Gauge
-	totalScrapes  prometheus.Counter
-	scrapeErrors  *prometheus.CounterVec
-	memoryUse     *prometheus.GaugeVec
-	fsUse         *prometheus.GaugeVec
-	workerUp      prometheus.Gauge
-	dbmanager     db.Manager
-	statusManager *status.AppRuntimeSyncClient
-	cache         *cache.DiskCache
+	dsn               string
+	error             prometheus.Gauge
+	totalScrapes      prometheus.Counter
+	scrapeErrors      *prometheus.CounterVec
+	workerUp          prometheus.Gauge
+	dbmanager         db.Manager
+	masterController  *master.Controller
+	controllermanager *controller.Manager
+	taskNum           prometheus.Counter
+	taskUpNum         prometheus.Gauge
+	taskError         prometheus.Counter
 }
 
 var scrapeDurationDesc = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "exporter", "collector_duration_seconds"),
 	"Collector time duration.",
 	[]string{"collector"}, nil,
+)
+
+var healthDesc = prometheus.NewDesc(
+	prometheus.BuildFQName(namespace, "exporter", "health_status"),
+	"health status.",
+	[]string{"service_name"}, nil,
 )
 
 //Describe Describe
@@ -72,61 +74,35 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.scrape(ch)
-
 	ch <- e.totalScrapes
 	ch <- e.error
-	e.fsUse.Collect(ch)
-	e.memoryUse.Collect(ch)
 	e.scrapeErrors.Collect(ch)
 	ch <- e.workerUp
 }
 
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	e.totalScrapes.Inc()
-	var err error
-	scrapeTime := time.Now()
-	services, err := e.dbmanager.TenantServiceDao().GetAllServices()
-	if err != nil {
-		logrus.Errorln("Error scraping for tenant service when select db :", err)
-		e.scrapeErrors.WithLabelValues("db.getservices").Inc()
-		e.error.Set(1)
+	e.masterController.Scrape(ch, scrapeDurationDesc)
+	healthInfo := discover.HealthCheck()
+	healthStatus := healthInfo["status"]
+	var val float64
+	if healthStatus == "health" {
+		val = 1
+	} else {
+		val = 0
 	}
-	status, err := e.statusManager.GetNeedBillingStatus()
-	if err != nil {
-		logrus.Errorln("Error scraping for tenant service when select db :", err)
-		e.scrapeErrors.WithLabelValues("db.getservices").Inc()
-		e.error.Set(1)
-	}
-	localPath := os.Getenv("LOCAL_DATA_PATH")
-	sharePath := os.Getenv("SHARE_DATA_PATH")
-	if localPath == "" {
-		localPath = "/grlocaldata"
-	}
-	if sharePath == "" {
-		sharePath = "/grdata"
-	}
-	//获取内存使用情况
-	for _, service := range services {
-		if _, ok := status[service.ServiceID]; ok {
-			e.memoryUse.WithLabelValues(service.TenantID, service.ServiceID, "running").Set(float64(service.ContainerMemory * service.Replicas))
-		}
-	}
-	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, time.Since(scrapeTime).Seconds(), "collect.memory")
-	scrapeTime = time.Now()
-	diskcache := e.cache.Get()
-	for k, v := range diskcache {
-		key := strings.Split(k, "_")
-		if len(key) == 2 {
-			e.fsUse.WithLabelValues(key[1], key[0], string(model.ShareFileVolumeType)).Set(v)
-		}
-	}
-	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, time.Since(scrapeTime).Seconds(), "collect.fs")
+	ch <- prometheus.MustNewConstMetric(healthDesc, prometheus.GaugeValue, val, "worker")
+	ch <- prometheus.MustNewConstMetric(e.taskUpNum.Desc(),
+		prometheus.GaugeValue,
+		float64(e.controllermanager.GetControllerSize()))
+	ch <- prometheus.MustNewConstMetric(e.taskNum.Desc(), prometheus.CounterValue, discover.TaskNum)
+	ch <- prometheus.MustNewConstMetric(e.taskError.Desc(), prometheus.CounterValue, discover.TaskError)
 }
 
-var namespace = "app_resource"
+var namespace = "worker"
 
 //New 创建一个收集器
-func New(statusManager *status.AppRuntimeSyncClient, cache *cache.DiskCache) *Exporter {
+func New(masterController *master.Controller, controllermanager *controller.Manager) *Exporter {
 	return &Exporter{
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
@@ -151,18 +127,25 @@ func New(statusManager *status.AppRuntimeSyncClient, cache *cache.DiskCache) *Ex
 			Name:      "up",
 			Help:      "Whether the Worker server is up.",
 		}),
-		memoryUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		taskUpNum: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "appmemory",
-			Help:      "tenant service memory used.",
-		}, []string{"tenant_id", "service_id", "service_status"}),
-		fsUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:      "task_up_number",
+			Help:      "Number of tasks being performed",
+		}),
+		taskNum: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "appfs",
-			Help:      "tenant service fs used.",
-		}, []string{"tenant_id", "service_id", "volume_type"}),
-		dbmanager:     db.GetManager(),
-		statusManager: statusManager,
-		cache:         cache,
+			Subsystem: "exporter",
+			Name:      "worker_task_number",
+			Help:      "worker total number of tasks.",
+		}),
+		taskError: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "exporter",
+			Name:      "worker_task_error",
+			Help:      "worker number of task errors.",
+		}),
+		dbmanager:         db.GetManager(),
+		masterController:  masterController,
+		controllermanager: controllermanager,
 	}
 }

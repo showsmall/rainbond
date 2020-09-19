@@ -20,9 +20,9 @@ package store
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/goodrain/rainbond/eventlog/db"
-	"github.com/goodrain/rainbond/eventlog/util"
 	coreutil "github.com/goodrain/rainbond/util"
 
 	"github.com/goodrain/rainbond/eventlog/conf"
@@ -41,11 +41,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Sirupsen/logrus"
-	mysql "github.com/goodrain/rainbond/db"
+	"github.com/sirupsen/logrus"
 	"github.com/pquerna/ffjson/ffjson"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/tidwall/gjson"
 )
 
 //Manager 存储管理器
@@ -54,6 +52,7 @@ type Manager interface {
 	SubMessageChan() chan [][]byte
 	PubMessageChan() chan [][]byte
 	DockerLogMessageChan() chan []byte
+	GetDockerLogs(serviceID string, length int) []string
 	MonitorMessageChan() chan [][]byte
 	WebSocketMessageChan(mode, eventID, subID string) chan *db.EventLogMessage
 	NewMonitorMessageChan() chan []byte
@@ -63,12 +62,12 @@ type Manager interface {
 	Monitor() []db.MonitorData
 	Scrape(ch chan<- prometheus.Metric, namespace, exporter, from string) error
 	Error() chan error
+	HealthCheck() map[string]string
 }
 
 //NewManager 存储管理器
 func NewManager(conf conf.EventStoreConf, log *logrus.Entry) (Manager, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
+	conf.DB.Type = "eventfile"
 	dbPlugin, err := db.NewManager(conf.DB, log)
 	if err != nil {
 		return nil, err
@@ -78,6 +77,7 @@ func NewManager(conf conf.EventStoreConf, log *logrus.Entry) (Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	storeManager := &storeManager{
 		cancel:                cancel,
 		context:               ctx,
@@ -97,12 +97,10 @@ func NewManager(conf conf.EventStoreConf, log *logrus.Entry) (Manager, error) {
 	handle := NewStore("handle", storeManager)
 	read := NewStore("read", storeManager)
 	docker := NewStore("docker_log", storeManager)
-	monitor := NewStore("monitor", storeManager)
 	newmonitor := NewStore("newmonitor", storeManager)
 	storeManager.handleMessageStore = handle
 	storeManager.readMessageStore = read
 	storeManager.dockerLogStore = docker
-	storeManager.monitorMessageStore = monitor
 	storeManager.newmonitorMessageStore = newmonitor
 	return storeManager, nil
 }
@@ -113,7 +111,6 @@ type storeManager struct {
 	handleMessageStore     MessageStore
 	readMessageStore       MessageStore
 	dockerLogStore         MessageStore
-	monitorMessageStore    MessageStore
 	newmonitorMessageStore MessageStore
 	receiveChan            chan []byte
 	pubChan, subChan       chan [][]byte
@@ -128,28 +125,56 @@ type storeManager struct {
 	errChan                chan error
 }
 
+func (s *storeManager) HealthCheck() map[string]string {
+	receiveChan := len(s.receiveChan) == 300
+	pubChan := len(s.pubChan) == 300
+	subChan := len(s.subChan) == 300
+	dockerLogChan := len(s.dockerLogChan) == 2048
+	monitorMessageChan := len(s.monitorMessageChan) == 100
+	newmonitorMessageChan := len(s.newmonitorMessageChan) == 2048
+	if receiveChan || pubChan || subChan || dockerLogChan || monitorMessageChan || newmonitorMessageChan {
+		return map[string]string{"status": "unusual", "info": "channel blockage"}
+	}
+	return map[string]string{"status": "health", "info": "eventlog service health"}
+}
+
 //Scrape prometheue monitor metrics
 //step1: docker log monitor
 //step2: event message monitor
 //step3: monitor message monitor
+var healthStatus float64
+
 func (s *storeManager) Scrape(ch chan<- prometheus.Metric, namespace, exporter, from string) error {
+
 	s.dockerLogStore.Scrape(ch, namespace, exporter, from)
 	s.handleMessageStore.Scrape(ch, namespace, exporter, from)
-	s.monitorMessageStore.Scrape(ch, namespace, exporter, from)
+	s.newmonitorMessageStore.Scrape(ch, namespace, exporter, from)
 	chanDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, exporter, "chan_cache_size"),
 		"the handle chan cache size.",
 		[]string{"from", "chan"}, nil,
 	)
+	var healthDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, exporter, "health_status"),
+		"health status.",
+		[]string{"service_name"}, nil,
+	)
+	healthInfo := s.HealthCheck()
+	if healthInfo["status"] == "health" {
+		healthStatus = 1
+	} else {
+		healthStatus = 0
+	}
 	ch <- prometheus.MustNewConstMetric(chanDesc, prometheus.GaugeValue, float64(len(s.dockerLogChan)), from, "container_log")
 	ch <- prometheus.MustNewConstMetric(chanDesc, prometheus.GaugeValue, float64(len(s.monitorMessageChan)), from, "monitor_message")
 	ch <- prometheus.MustNewConstMetric(chanDesc, prometheus.GaugeValue, float64(len(s.receiveChan)), from, "event_message")
+	ch <- prometheus.MustNewConstMetric(healthDesc, prometheus.GaugeValue, healthStatus, "eventlog")
 	return nil
 }
 
 func (s *storeManager) Monitor() []db.MonitorData {
 	data := s.dockerLogStore.GetMonitorData()
-	moData := s.monitorMessageStore.GetMonitorData()
+	moData := s.newmonitorMessageStore.GetMonitorData()
 	if moData != nil {
 		data.LogSizePeerM += moData.LogSizePeerM
 		data.ServiceSize += moData.ServiceSize
@@ -214,10 +239,6 @@ func (s *storeManager) WebSocketMessageChan(mode, eventID, subID string) chan *d
 		ch := s.dockerLogStore.SubChan(eventID, subID)
 		return ch
 	}
-	if mode == "monitor" {
-		ch := s.monitorMessageStore.SubChan(eventID, subID)
-		return ch
-	}
 	if mode == "newmonitor" {
 		ch := s.newmonitorMessageStore.SubChan(eventID, subID)
 		return ch
@@ -230,7 +251,6 @@ func (s *storeManager) Run() error {
 	s.handleMessageStore.Run()
 	s.readMessageStore.Run()
 	s.dockerLogStore.Run()
-	s.monitorMessageStore.Run()
 	s.newmonitorMessageStore.Run()
 	for i := 0; i < s.conf.HandleMessageCoreNumber; i++ {
 		go s.handleReceiveMessage()
@@ -241,12 +261,8 @@ func (s *storeManager) Run() error {
 	for i := 0; i < s.conf.HandleDockerLogCoreNumber; i++ {
 		go s.handleDockerLog()
 	}
-	for i := 0; i < s.conf.HandleMessageCoreNumber; i++ {
-		go s.handleMonitorMessage()
-	}
 	go s.handleNewMonitorMessage()
 	go s.cleanLog()
-	go s.delServiceEventlog()
 	return nil
 }
 
@@ -263,8 +279,10 @@ func (s *storeManager) cleanLog() {
 			logrus.Error("list log dir error, ", err.Error())
 		} else {
 			for _, fi := range files {
-				if err := s.deleteFile(fi); err != nil {
-					logrus.Errorf("delete log file %s error. %s", fi, err.Error())
+				if !strings.Contains(fi, "eventlog") {
+					if err := s.deleteFile(fi); err != nil {
+						logrus.Errorf("delete log file %s error. %s", fi, err.Error())
+					}
 				}
 			}
 		}
@@ -289,39 +307,19 @@ func (s *storeManager) deleteFile(filename string) error {
 	if err != nil {
 		return err
 	}
-	if now.After(theTime.Add(7 * time.Hour * 24)) {
+	saveDay, _ := strconv.Atoi(os.Getenv("DOCKER_LOG_SAVE_DAY"))
+	if saveDay == 0 {
+		saveDay = 7
+	}
+	if now.After(theTime.Add(time.Duration(saveDay) * time.Hour * 24)) {
 		if err := os.Remove(filename); err != nil {
 			if !strings.Contains(err.Error(), "No such file or directory") {
 				return err
 			}
 		}
-		logrus.Debug("clean service log %s", filename)
+		logrus.Debugf("clean service log %s", filename)
 	}
 	return nil
-}
-
-func (s *storeManager) delServiceEventlog() {
-	m := mysql.GetManager()
-	coreutil.Exec(s.context, func() error {
-		now := time.Now()
-		messageRaw, err := m.EventLogDao().GetAllServiceEventLog()
-		if err != nil {
-			logrus.Error("not search query")
-		} else {
-			for _, v := range messageRaw {
-				startTime := v.StartTime
-				tm2, _ := time.Parse("2006-01-02T15:04:05+08:00", startTime)
-				if now.After(tm2.Add(30 * time.Hour * 24)) {
-					if err := m.EventLogDao().DeleteServiceEventLog(v); err != nil {
-						logrus.Error("Failed to delete the log")
-					}
-				}
-			}
-		}
-		return nil
-
-	}, time.Hour*24)
-
 }
 
 func (s *storeManager) checkHealth() {
@@ -439,10 +437,6 @@ func (s *storeManager) handleSubMessage() {
 				if string(msg[0]) == string(db.EventMessage) {
 					s.readMessageStore.InsertMessage(message)
 				}
-				if string(msg[0]) == string(db.ServiceMonitorMessage) {
-					s.monitorMessageStore.InsertMessage(message)
-				}
-
 			}
 		}
 	}
@@ -484,115 +478,17 @@ loop:
 				Content: buffer.Bytes(),
 				EventID: serviceID,
 			}
-			//s.log.Debug("Receive docker log:", info)
 			s.dockerLogStore.InsertMessage(&message)
 			buffer.Reset()
 		}
 	}
-
 	s.errChan <- fmt.Errorf("handle docker log core exist")
-
 }
 
 type event struct {
 	Name   string        `json:"name"`
 	Data   []interface{} `json:"data"`
 	Update string        `json:"update_time"`
-}
-
-func (s *storeManager) handleMonitorMessage() {
-loop:
-	for {
-		select {
-		case <-s.context.Done():
-			return
-		case msg, ok := <-s.monitorMessageChan:
-			if !ok {
-				s.log.Error("handle monitor message core stop.monitor message log chan closed")
-				break loop
-			}
-			if msg == nil {
-				continue
-			}
-			if len(msg) == 2 {
-				message := strings.SplitAfterN(string(msg[1]), " ", 5)
-				name := message[3]
-				body := message[4]
-				var currentTopic string
-				var data []interface{}
-				switch strings.TrimSpace(name) {
-				case "SumTimeByUrl":
-					result := gjson.Parse(body).Array()
-					for _, r := range result {
-						var port int
-						if p, ok := r.Map()["port"]; ok {
-							port = int(p.Int())
-						}
-						wsTopic := fmt.Sprintf("%s.%s.statistic", r.Map()["tenant"], r.Map()["service"])
-						if port != 0 {
-							wsTopic = fmt.Sprintf("%s.%s.%d.statistic", r.Map()["tenant"], r.Map()["service"], port)
-						}
-						if currentTopic == "" {
-							currentTopic = wsTopic
-						}
-						if wsTopic == currentTopic {
-							data = append(data, util.Format(r.Map()))
-						} else {
-							s.sendMonitorData("SumTimeByUrl", data, currentTopic)
-							currentTopic = wsTopic
-							data = []interface{}{util.Format(r.Map())}
-						}
-					}
-					s.sendMonitorData("SumTimeByUrl", data, currentTopic)
-
-				case "SumTimeBySql":
-					result := gjson.Parse(body).Array()
-					for _, r := range result {
-						tenantID := r.Map()["tenant_id"].String()
-						serviceID := r.Map()["service_id"].String()
-						if len(tenantID) < 12 || len(serviceID) < 12 {
-							continue
-						}
-						tenantAlias := tenantID[len(tenantID)-12:]
-						serviceAlias := serviceID[len(serviceID)-12:]
-						wsTopic := fmt.Sprintf("%s.%s.statistic", tenantAlias, serviceAlias)
-						if currentTopic == "" {
-							currentTopic = wsTopic
-						}
-						if wsTopic == currentTopic {
-							data = append(data, util.Format(r.Map()))
-						} else {
-							s.sendMonitorData("SumTimeBySql", data, currentTopic)
-							currentTopic = wsTopic
-							data = []interface{}{util.Format(r.Map())}
-						}
-					}
-					s.sendMonitorData("SumTimeBySql", data, currentTopic)
-				}
-			}
-
-		}
-	}
-	s.errChan <- fmt.Errorf("handle monitor log core exist")
-}
-func (s *storeManager) sendMonitorData(name string, data []interface{}, topic string) {
-	e := event{
-		Name:   name,
-		Update: time.Now().Format(time.Kitchen),
-		Data:   data,
-	}
-	eventByte, _ := json.Marshal(e)
-	m := &db.EventLogMessage{
-		EventID:     topic,
-		MonitorData: eventByte,
-	}
-	s.monitorMessageStore.InsertMessage(m)
-	d, err := json.Marshal(m)
-	if err != nil {
-		s.log.Error("Marshal monitor message to byte error.", err.Error())
-		return
-	}
-	s.pubChan <- [][]byte{[]byte(db.ServiceMonitorMessage), d}
 }
 
 func (s *storeManager) RealseWebSocketMessageChan(mode string, eventID, subID string) {
@@ -602,8 +498,8 @@ func (s *storeManager) RealseWebSocketMessageChan(mode string, eventID, subID st
 	if mode == "docker" {
 		s.dockerLogStore.RealseSubChan(eventID, subID)
 	}
-	if mode == "monitor" {
-		s.monitorMessageStore.RealseSubChan(eventID, subID)
+	if mode == "newmonitor" {
+		s.newmonitorMessageStore.RealseSubChan(eventID, subID)
 	}
 }
 
@@ -611,7 +507,7 @@ func (s *storeManager) Stop() {
 	s.handleMessageStore.stop()
 	s.readMessageStore.stop()
 	s.dockerLogStore.stop()
-	s.monitorMessageStore.stop()
+	s.newmonitorMessageStore.stop()
 	s.cancel()
 	if s.filePlugin != nil {
 		s.filePlugin.Close()
@@ -623,4 +519,9 @@ func (s *storeManager) Stop() {
 }
 func (s *storeManager) Error() chan error {
 	return s.errChan
+}
+
+//GetDockerLogs get history docker log
+func (s *storeManager) GetDockerLogs(serviceID string, length int) []string {
+	return s.dockerLogStore.GetHistoryMessage(serviceID, length)
 }

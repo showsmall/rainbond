@@ -30,7 +30,8 @@ import (
 
 	"context"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
 )
 
 var (
@@ -45,8 +46,8 @@ type Client struct {
 }
 
 //NewClient 创建client
-func NewClient(cfg *conf.Conf) (err error) {
-	cli, err := client.New(cfg.Etcd)
+func NewClient(ctx context.Context, cfg *conf.Conf, etcdClientArgs *etcdutil.ClientArgs) (err error) {
+	cli, err := etcdutil.NewClient(ctx, etcdClientArgs)
 	if err != nil {
 		return
 	}
@@ -57,7 +58,7 @@ func NewClient(cfg *conf.Conf) (err error) {
 		Client:     cli,
 		reqTimeout: time.Duration(cfg.ReqTimeout) * time.Second,
 	}
-	logrus.Infof("init etcd client, endpoint is:%+x", cfg.Etcd.Endpoints)
+	logrus.Infof("init etcd client, endpoint is:%v", cfg.EtcdEndpoints)
 	DefalutClient = c
 	return
 }
@@ -176,7 +177,7 @@ func (c *Client) KeepAliveOnce(id client.LeaseID) (*client.LeaseKeepAliveRespons
 
 //GetLock GetLock
 func (c *Client) GetLock(key string, id client.LeaseID) (bool, error) {
-	key = conf.Config.Lock + key
+	key = conf.Config.LockPath + key
 	ctx, cancel := context.WithTimeout(context.Background(), c.reqTimeout)
 	resp, err := DefalutClient.Txn(ctx).
 		If(client.Compare(client.CreateRevision(key), "=", 0)).
@@ -193,7 +194,7 @@ func (c *Client) GetLock(key string, id client.LeaseID) (bool, error) {
 
 //DelLock DelLock
 func (c *Client) DelLock(key string) error {
-	_, err := c.Delete(conf.Config.Lock + key)
+	_, err := c.Delete(conf.Config.LockPath + key)
 	return err
 }
 

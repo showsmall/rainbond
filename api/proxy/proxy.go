@@ -24,17 +24,20 @@ import "net/http"
 type Proxy interface {
 	Proxy(w http.ResponseWriter, r *http.Request)
 	Do(r *http.Request) (*http.Response, error)
-	UpdateEndpoints(endpoints ...string)
+	UpdateEndpoints(endpoints ...string) // format: ["name=>ip:port", ...]
 }
 
-//CreateProxy 创建代理
+//CreateProxy create proxy
 func CreateProxy(name string, mode string, endpoints []string) Proxy {
 	switch mode {
 	case "websocket":
 		return createWebSocketProxy(name, endpoints)
 	case "http":
-		return createHTTPProxy(name, endpoints)
+		if name == "eventlog" {
+			return createHTTPProxy(name, endpoints, NewSelectBalance())
+		}
+		return createHTTPProxy(name, endpoints, nil)
 	default:
-		return createHTTPProxy(name, endpoints)
+		return createHTTPProxy(name, endpoints, nil)
 	}
 }

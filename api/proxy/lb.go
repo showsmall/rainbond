@@ -19,13 +19,15 @@
 package proxy
 
 import (
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"sync/atomic"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
+
+//ContextKey context key
+type ContextKey string
 
 // RoundRobin round robin loadBalance impl
 type RoundRobin struct {
@@ -42,6 +44,37 @@ type Endpoint string
 
 func (e Endpoint) String() string {
 	return string(e)
+}
+
+//GetName get endpoint name
+func (e Endpoint) GetName() string {
+	if kv := strings.Split(string(e), "=>"); len(kv) > 1 {
+		return kv[0]
+	}
+	return string(e)
+}
+
+//GetAddr get addr
+func (e Endpoint) GetAddr() string {
+	if kv := strings.Split(string(e), "=>"); len(kv) > 1 {
+		return kv[1]
+	}
+	return string(e)
+}
+
+//GetHTTPAddr get http url
+func (e Endpoint) GetHTTPAddr() string {
+	if kv := strings.Split(string(e), "=>"); len(kv) > 1 {
+		return withScheme(kv[1])
+	}
+	return withScheme(string(e))
+}
+
+func withScheme(s string) string {
+	if strings.HasPrefix(s, "http") {
+		return s
+	}
+	return "http://" + s
 }
 
 //EndpointList EndpointList
@@ -122,39 +155,42 @@ type SelectBalance struct {
 
 //NewSelectBalance  创建选择性负载均衡
 func NewSelectBalance() *SelectBalance {
-	body, err := ioutil.ReadFile("/etc/goodrain/host_id_list.conf")
-	if err != nil {
-		logrus.Error("read host id list error,", err.Error())
-	}
-	sb := &SelectBalance{
+	return &SelectBalance{
 		hostIDMap: map[string]string{"local": "127.0.0.1:6363"},
 	}
-	if body != nil && len(body) > 0 {
-		listStr := string(body)
-		hosts := strings.Split(strings.TrimSpace(listStr), ";")
-		for _, h := range hosts {
-			info := strings.Split(strings.Trim(h, "\r\n"), "=")
-			if len(info) == 2 {
-				sb.hostIDMap[info[0]] = info[1]
-			}
-		}
-	}
-	logrus.Info("Docker log websocket server endpoints:", sb.hostIDMap)
-	return sb
 }
 
 //Select 负载
 func (s *SelectBalance) Select(r *http.Request, endpoints EndpointList) Endpoint {
-	if r.URL != nil {
-		hostID := r.URL.Query().Get("host_id")
-		if e, ok := s.hostIDMap[hostID]; ok {
-			if endpoints.HaveEndpoint(e) {
-				return Endpoint(e)
-			}
+	if r.URL == nil {
+		return Endpoint(s.hostIDMap["local"])
+	}
+
+	id2ip := map[string]string{"local": "127.0.0.1:6363"}
+	for _, end := range endpoints {
+		if kv := strings.Split(string(end), "=>"); len(kv) > 1 {
+			id2ip[kv[0]] = kv[1]
 		}
 	}
-	if len(endpoints) > 0 {
-		return endpoints[0]
+
+	if r.URL != nil {
+		hostID := r.URL.Query().Get("host_id")
+		if hostID == "" {
+			hostIDFromContext := r.Context().Value(ContextKey("host_id"))
+			if hostIDFromContext != nil {
+				hostID = hostIDFromContext.(string)
+			}
+		}
+		if e, ok := id2ip[hostID]; ok {
+			logrus.Infof("[lb selelct] find host %s from name %s success", e, hostID)
+			return Endpoint(e)
+		}
 	}
+
+	if len(endpoints) > 0 {
+		logrus.Infof("default endpoint is %s", endpoints[len(endpoints)-1])
+		return endpoints[len(endpoints)-1]
+	}
+
 	return Endpoint(s.hostIDMap["local"])
 }

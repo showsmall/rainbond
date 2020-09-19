@@ -32,6 +32,7 @@ func init() {
 	checkFuncList = append(checkFuncList, javaMaven)
 	checkFuncList = append(checkFuncList, php)
 	checkFuncList = append(checkFuncList, python)
+	checkFuncList = append(checkFuncList, nodeJSStatic)
 	checkFuncList = append(checkFuncList, nodejs)
 	checkFuncList = append(checkFuncList, ruby)
 	checkFuncList = append(checkFuncList, static)
@@ -40,6 +41,7 @@ func init() {
 	checkFuncList = append(checkFuncList, gradle)
 	checkFuncList = append(checkFuncList, grails)
 	checkFuncList = append(checkFuncList, scala)
+	checkFuncList = append(checkFuncList, netcore)
 }
 
 //ErrCodeNotExist 代码为空错误
@@ -56,6 +58,11 @@ var ErrRainbondFileNotFound = fmt.Errorf("rainbond file not found")
 
 //Lang 语言类型
 type Lang string
+
+//String return lang string
+func (l Lang) String() string {
+	return string(l)
+}
 
 //NO 空语言类型
 var NO Lang = "no"
@@ -87,6 +94,9 @@ var JavaJar Lang = "Java-jar"
 //Nodejs Lang
 var Nodejs Lang = "Node.js"
 
+//NodeJSStatic static Lang
+var NodeJSStatic Lang = "NodeJSStatic"
+
 //Static Lang
 var Static Lang = "static"
 
@@ -101,6 +111,9 @@ var Gradle Lang = "Gradle"
 
 //Grails Lang
 var Grails Lang = "Grails"
+
+//NetCore Lang
+var NetCore Lang = ".NetCore"
 
 //GetLangType check code lang
 func GetLangType(homepath string) (Lang, error) {
@@ -139,6 +152,9 @@ func python(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "setup.py")); ok {
 		return Python
 	}
+	if ok, _ := util.FileExists(path.Join(homepath, "Pipfile")); ok {
+		return Python
+	}
 	return NO
 }
 func ruby(homepath string) Lang {
@@ -158,6 +174,27 @@ func php(homepath string) Lang {
 }
 func javaMaven(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "pom.xml")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.atom")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.clj")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.groovy")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.rb")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.scala")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.yaml")); ok {
+		return JavaMaven
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "pom.yml")); ok {
 		return JavaMaven
 	}
 	return NO
@@ -182,6 +219,15 @@ func nodejs(homepath string) Lang {
 	}
 	return NO
 }
+func nodeJSStatic(homepath string) Lang {
+	if ok, _ := util.FileExists(path.Join(homepath, "package.json")); ok {
+		if ok, _ := util.FileExists(path.Join(homepath, "nodestatic.json")); ok {
+			return NodeJSStatic
+		}
+	}
+	return NO
+}
+
 func static(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "index.html")); ok {
 		return Static
@@ -189,8 +235,12 @@ func static(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "index.htm")); ok {
 		return Static
 	}
+	if ok, _ := util.FileExists(path.Join(homepath, "static.json")); ok {
+		return Static
+	}
 	return NO
 }
+
 func clojure(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "project.clj")); ok {
 		return Clojure
@@ -198,10 +248,19 @@ func clojure(homepath string) Lang {
 	return NO
 }
 func golang(homepath string) Lang {
+	if ok, _ := util.FileExists(path.Join(homepath, "go.mod")); ok {
+		return Golang
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "Gopkg.lock")); ok {
+		return Golang
+	}
 	if ok, _ := util.FileExists(path.Join(homepath, "Godeps", "Godeps.json")); ok {
 		return Golang
 	}
-	if ok, _ := util.FileExists(path.Join(homepath, "vendor", "Govendor.json")); ok {
+	if ok, _ := util.FileExists(path.Join(homepath, "vendor", "vendor.json")); ok {
+		return Golang
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "glide.yaml")); ok {
 		return Golang
 	}
 	if ok := util.FileExistsWithSuffix(path.Join(homepath, "src"), ".go"); ok {
@@ -213,11 +272,28 @@ func gradle(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "build.gradle")); ok {
 		return Gradle
 	}
+	if ok, _ := util.FileExists(path.Join(homepath, "gradlew")); ok {
+		return Gradle
+	}
+	if ok, _ := util.FileExists(path.Join(homepath, "settings.gradle")); ok {
+		return Gradle
+	}
 	return NO
 }
 func grails(homepath string) Lang {
 	if ok, _ := util.FileExists(path.Join(homepath, "grails-app")); ok {
 		return Grails
+	}
+	return NO
+}
+
+//netcore
+func netcore(homepath string) Lang {
+	if ok := util.FileExistsWithSuffix(homepath, ".sln"); ok {
+		return NetCore
+	}
+	if ok := util.FileExistsWithSuffix(homepath, ".csproj"); ok {
+		return NetCore
 	}
 	return NO
 }

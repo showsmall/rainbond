@@ -22,6 +22,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/goodrain/rainbond/mq/client"
+
 	"github.com/goodrain/rainbond/builder/exector"
 
 	"github.com/twinj/uuid"
@@ -30,17 +32,15 @@ import (
 
 	"github.com/goodrain/rainbond/db"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
-	api_db "github.com/goodrain/rainbond/api/db"
 	api_model "github.com/goodrain/rainbond/api/model"
 	"github.com/goodrain/rainbond/api/util"
-	"github.com/goodrain/rainbond/mq/api/grpc/pb"
 )
 
 //ServiceShareHandle service share
 type ServiceShareHandle struct {
-	MQClient pb.TaskQueueClient
+	MQClient client.MQClient
 	EtcdCli  *clientv3.Client
 }
 
@@ -54,7 +54,6 @@ type APIResult struct {
 
 //Share 分享应用
 func (s *ServiceShareHandle) Share(serviceID string, ss api_model.ServiceShare) (*APIResult, *util.APIHandleError) {
-
 	service, err := db.GetManager().TenantServiceDao().GetServiceByID(serviceID)
 	if err != nil {
 		return nil, util.CreateAPIHandleErrorFromDBError("查询应用出错", err)
@@ -66,12 +65,12 @@ func (s *ServiceShareHandle) Share(serviceID string, ss api_model.ServiceShare) 
 	}
 	shareID := uuid.NewV4().String()
 	var slugPath, shareImageName string
-	var bs api_db.BuildTaskStruct
-	if service.IsSlug() {
+	var task client.TaskStruct
+	if version.DeliveredType == "slug" {
 		shareSlugInfo := ss.Body.SlugInfo
 		slugPath = service.CreateShareSlug(ss.Body.ServiceKey, shareSlugInfo.Namespace, ss.Body.AppVersion)
 		if ss.Body.SlugInfo.FTPHost == "" {
-			slugPath = fmt.Sprintf("/grdata/build/tenant/app_publish/%s", slugPath)
+			slugPath = fmt.Sprintf("/grdata/build/tenant/%s", slugPath)
 		}
 		info := map[string]interface{}{
 			"service_alias": ss.ServiceAlias,
@@ -86,37 +85,35 @@ func (s *ServiceShareHandle) Share(serviceID string, ss api_model.ServiceShare) 
 		} else {
 			info["local_slug_path"] = fmt.Sprintf("/grdata/build/tenant/%s/slug/%s/%s.tgz", service.TenantID, service.ServiceID, service.DeployVersion)
 		}
-		body, _ := ffjson.Marshal(info)
-		bs.TaskType = "share-slug"
-		bs.TaskBody = body
-		bs.User = ss.Body.ShareUser
+		task.TaskType = "share-slug"
+		task.TaskBody = info
 	} else {
 		shareImageInfo := ss.Body.ImageInfo
-		shareImageName, err = service.CreateShareImage(shareImageInfo.HubURL, shareImageInfo.Namespace, ss.Body.AppVersion)
+		shareImageName, err = version.CreateShareImage(shareImageInfo.HubURL, shareImageInfo.Namespace, ss.Body.AppVersion)
 		if err != nil {
 			return nil, util.CreateAPIHandleError(500, err)
 		}
 		info := map[string]interface{}{
-			"share_info":       ss.Body,
-			"service_alias":    ss.ServiceAlias,
-			"service_id":       serviceID,
-			"tenant_name":      ss.TenantName,
-			"image_name":       shareImageName,
-			"share_id":         shareID,
-			"local_image_name": service.ImageName,
+			"share_info":    ss.Body,
+			"service_alias": ss.ServiceAlias,
+			"service_id":    serviceID,
+			"tenant_name":   ss.TenantName,
+			"image_name":    shareImageName,
+			"share_id":      shareID,
 		}
 		if version != nil && version.DeliveredPath != "" {
 			info["local_image_name"] = version.DeliveredPath
 		}
-		body, _ := ffjson.Marshal(info)
-		bs.TaskType = "share-image"
-		bs.TaskBody = body
-		bs.User = ss.Body.ShareUser
+		task.TaskType = "share-image"
+		task.TaskBody = info
 	}
-	eq, _ := api_db.BuildTaskBuild(&bs)
-	ctx, cancel := context.WithCancel(context.Background())
-	_, err = s.MQClient.Enqueue(ctx, eq)
-	cancel()
+	label, err := db.GetManager().TenantServiceLabelDao().GetLabelByNodeSelectorKey(serviceID, "windows")
+	if label == nil || err != nil {
+		task.Topic = client.BuilderTopic
+	} else {
+		task.Topic = client.WindowsBuilderTopic
+	}
+	err = s.MQClient.SendBuilderTopic(task)
 	if err != nil {
 		logrus.Errorf("equque mq error, %v", err)
 		return nil, util.CreateAPIHandleError(502, err)

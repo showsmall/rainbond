@@ -19,7 +19,7 @@
 package model
 
 import (
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/docker/distribution/reference"
 )
 
@@ -37,7 +37,7 @@ type TenantPlugin struct {
 	GitURL string `gorm:"column:git_url" json:"git_url"`
 	//build mode
 	BuildModel string `gorm:"column:build_model" json:"build_model"`
-	//plugin model
+	//plugin model InitPlugin,InBoundNetPlugin,OutBoundNetPlugin
 	PluginModel string `gorm:"column:plugin_model" json:"plugin_model"`
 	//tenant id
 	TenantID string `gorm:"column:tenant_id" json:"tenant_id"`
@@ -134,6 +134,19 @@ func (t *TenantPluginVersionEnv) TableName() string {
 	return "tenant_plugin_version_env"
 }
 
+//TenantPluginVersionDiscoverConfig service plugin config that can be dynamic discovery
+type TenantPluginVersionDiscoverConfig struct {
+	Model
+	PluginID  string `gorm:"column:plugin_id;size:32" json:"plugin_id"`
+	ServiceID string `gorm:"column:service_id;size:32" json:"service_id"`
+	ConfigStr string `gorm:"column:config_str;" sql:"type:text;" json:"config_str"`
+}
+
+//TableName table name
+func (t *TenantPluginVersionDiscoverConfig) TableName() string {
+	return "tenant_plugin_version_config"
+}
+
 //TenantServicePluginRelation TenantServicePluginRelation
 type TenantServicePluginRelation struct {
 	Model
@@ -177,11 +190,14 @@ func (t *TenantServicesStreamPluginPort) TableName() string {
 //InitPlugin 初始化插件
 var InitPlugin = "init-plugin"
 
-//UpNetPlugin 上游网络插件
-var UpNetPlugin = "net-plugin:up"
+//InBoundNetPlugin 入站治理网络插件
+var InBoundNetPlugin = "net-plugin:up"
 
-//DownNetPlugin 下游网络插件
-var DownNetPlugin = "net-plugin:down"
+//OutBoundNetPlugin 出站治理网络插件
+var OutBoundNetPlugin = "net-plugin:down"
+
+//InBoundAndOutBoundNetPlugin 出站和入站治理
+var InBoundAndOutBoundNetPlugin = "net-plugin:in-and-out"
 
 //GeneralPlugin 一般插件,默认分类,优先级最低
 var GeneralPlugin = "general-plugin"

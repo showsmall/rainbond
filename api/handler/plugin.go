@@ -19,34 +19,30 @@
 package handler
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
 
-	api_db "github.com/goodrain/rainbond/api/db"
 	api_model "github.com/goodrain/rainbond/api/model"
 	"github.com/goodrain/rainbond/api/util"
 	"github.com/goodrain/rainbond/db"
 	dbmodel "github.com/goodrain/rainbond/db/model"
 	"github.com/goodrain/rainbond/event"
-	"github.com/goodrain/rainbond/mq/api/grpc/pb"
+	"github.com/goodrain/rainbond/mq/client"
 	core_util "github.com/goodrain/rainbond/util"
-
-	"github.com/pquerna/ffjson/ffjson"
 
 	builder_model "github.com/goodrain/rainbond/builder/model"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 //PluginAction  plugin action struct
 type PluginAction struct {
-	MQClient pb.TaskQueueClient
+	MQClient client.MQClient
 }
 
 //CreatePluginManager get plugin manager
-func CreatePluginManager(mqClient pb.TaskQueueClient) *PluginAction {
+func CreatePluginManager(mqClient client.MQClient) *PluginAction {
 	return &PluginAction{
 		MQClient: mqClient,
 	}
@@ -93,6 +89,12 @@ func (p *PluginAction) UpdatePluginAct(pluginID, tenantID string, cps *api_model
 //DeletePluginAct DeletePluginAct
 func (p *PluginAction) DeletePluginAct(pluginID, tenantID string) *util.APIHandleError {
 	tx := db.GetManager().Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("Unexpected panic occurred, rollback transaction: %v", r)
+			tx.Rollback()
+		}
+	}()
 	//step1: delete service plugin relation
 	err := db.GetManager().TenantServicePluginRelationDaoTransactions(tx).DeleteALLRelationByPluginID(pluginID)
 	if err != nil {
@@ -130,6 +132,12 @@ func (p *PluginAction) GetPlugins(tenantID string) ([]*dbmodel.TenantPlugin, *ut
 //AddDefaultEnv AddDefaultEnv
 func (p *PluginAction) AddDefaultEnv(est *api_model.ENVStruct) *util.APIHandleError {
 	tx := db.GetManager().Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("Unexpected panic occurred, rollback transaction: %v", r)
+			tx.Rollback()
+		}
+	}()
 	for _, env := range est.Body.EVNInfo {
 		vis := &dbmodel.TenantPluginDefaultENV{
 			PluginID:  est.PluginID,
@@ -302,31 +310,18 @@ func (p *PluginAction) buildPlugin(b *api_model.BuildPluginStruct, plugin *dbmod
 		ImageInfo:     b.Body.ImageInfo,
 		Repo:          b.Body.RepoURL,
 		GitURL:        plugin.GitURL,
-	}
-	jtask, errJ := ffjson.Marshal(taskBody)
-	if errJ != nil {
-		logrus.Debugf("unmarshall jtask error, %v", errJ)
-		updateVersion()
-		return nil, errJ
+		GitUsername:   b.Body.Username,
+		GitPassword:   b.Body.Password,
 	}
 	taskType := "plugin_image_build"
 	if plugin.BuildModel == "dockerfile" {
 		taskType = "plugin_dockerfile_build"
 	}
-	ts := &api_db.BuildTaskStruct{
+	err := p.MQClient.SendBuilderTopic(client.TaskStruct{
 		TaskType: taskType,
-		TaskBody: jtask,
-		User:     b.Body.Operator,
-	}
-	eq, err := api_db.BuildTaskBuild(ts)
-	if err != nil {
-		logrus.Errorf("build equeue build plugin from image error, %v", err)
-		updateVersion()
-		return nil, err
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, err = p.MQClient.Enqueue(ctx, eq)
+		TaskBody: taskBody,
+		Topic:    client.BuilderTopic,
+	})
 	if err != nil {
 		updateVersion()
 		logrus.Errorf("equque mq error, %v", err)
@@ -366,6 +361,12 @@ func (p *PluginAction) GetPluginBuildVersion(pluginID, versionID string) (*dbmod
 func (p *PluginAction) DeletePluginBuildVersion(pluginID, versionID string) *util.APIHandleError {
 
 	tx := db.GetManager().Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("Unexpected panic occurred, rollback transaction: %v", r)
+			tx.Rollback()
+		}
+	}()
 	err := db.GetManager().TenantPluginBuildVersionDaoTransactions(tx).DeleteBuildVersionByVersionID(versionID)
 	if err != nil {
 		tx.Rollback()

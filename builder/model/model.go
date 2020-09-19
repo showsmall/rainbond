@@ -26,6 +26,8 @@ type BuildPluginTaskBody struct {
 	Operator      string `json:"operator"`
 	Repo          string `json:"repo"`
 	GitURL        string `json:"git_url"`
+	GitUsername   string `json:"git_username"`
+	GitPassword   string `json:"git_password"`
 	ImageURL      string `json:"image_url"`
 	EventID       string `json:"event_id"`
 	DeployVersion string `json:"deploy_version"`
@@ -71,21 +73,10 @@ type CodeCheckResult struct {
 	//DFR          *DockerFileResult `json:"dockerfile,omitempty"`
 }
 
-//AppPublish AppPublish
-type AppPublish struct {
-	ServiceKey string `json:"service_key"`
-	AppVersion string `json:"app_version"`
-	Image      string `json:"image,omitempty"`
-	Slug       string `json:"slug,omitempty"`
-	DestYS     bool   `json:"dest_ys,omitempty"`
-	DestYB     bool   `json:"dest_yb,omitempty"`
-	ShareID    string `json:"share_id,omitempty"`
-	Status     string `json:"status,omitempty"`
-}
-
 //ImageName ImageName
 type ImageName struct {
-	Host string `json:"host"`
-	Name string `json:"name"`
-	Tag  string `json:"tag"`
+	Host      string `json:"host"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Tag       string `json:"tag"`
 }

@@ -19,62 +19,60 @@
 package handler
 
 import (
-	"time"
-
-	"github.com/goodrain/rainbond/api/handler/group"
-
-	"github.com/goodrain/rainbond/api/handler/share"
-
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
 	api_db "github.com/goodrain/rainbond/api/db"
-	"github.com/goodrain/rainbond/appruntimesync/client"
+	"github.com/goodrain/rainbond/api/handler/group"
+	"github.com/goodrain/rainbond/api/handler/share"
 	"github.com/goodrain/rainbond/cmd/api/option"
+	"github.com/goodrain/rainbond/db"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
+	"github.com/goodrain/rainbond/worker/client"
+	"k8s.io/client-go/kubernetes"
 )
 
 //InitHandle 初始化handle
-func InitHandle(conf option.Config, statusCli *client.AppRuntimeSyncClient) error {
+func InitHandle(conf option.Config,
+	etcdClientArgs *etcdutil.ClientArgs,
+	statusCli *client.AppRuntimeSyncClient,
+	etcdcli *clientv3.Client,
+	kubeClient *kubernetes.Clientset,
+) error {
 	mq := api_db.MQManager{
-		EtcdEndpoint:  conf.EtcdEndpoint,
-		DefaultServer: conf.MQAPI,
+		EtcdClientArgs: etcdClientArgs,
+		DefaultServer:  conf.MQAPI,
 	}
 	mqClient, errMQ := mq.NewMQManager()
 	if errMQ != nil {
 		logrus.Errorf("new MQ manager failed, %v", errMQ)
 		return errMQ
 	}
-	k8s := api_db.K8SManager{
-		K8SConfig: conf.KubeConfig,
-	}
-	kubeClient, errK := k8s.NewKubeConnection()
-	if errK != nil {
-		logrus.Errorf("create kubeclient failed, %v", errK)
-		return errK
-	}
-	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   conf.EtcdEndpoint,
-		DialTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		logrus.Errorf("create etcd client v3 error, %v", err)
-		return err
-	}
-	defaultServieHandler = CreateManager(mqClient, kubeClient, etcdCli, statusCli)
+	dbmanager := db.GetManager()
+	defaultServieHandler = CreateManager(conf, mqClient, etcdcli, statusCli)
 	defaultPluginHandler = CreatePluginManager(mqClient)
 	defaultAppHandler = CreateAppManager(mqClient)
-	defaultTenantHandler = CreateTenManager(mqClient, kubeClient, statusCli)
-	defaultNetRulesHandler = CreateNetRulesManager(etcdCli)
-	defaultSourcesHandler = CreateSourcesManager(etcdCli)
+	defaultTenantHandler = CreateTenManager(mqClient, statusCli, &conf, kubeClient)
+	defaultNetRulesHandler = CreateNetRulesManager(etcdcli)
 	defaultCloudHandler = CreateCloudManager(conf)
-	defaultAPPBackupHandler = group.CreateBackupHandle(mqClient, statusCli, etcdCli)
-	//需要使用etcd v2 API
-	defaultEventHandler = CreateLogManager(conf.EtcdEndpoint)
-	shareHandler = &share.ServiceShareHandle{MQClient: mqClient, EtcdCli: etcdCli}
-	pluginShareHandler = &share.PluginShareHandle{MQClient: mqClient, EtcdCli: etcdCli}
+	defaultAPPBackupHandler = group.CreateBackupHandle(mqClient, statusCli, etcdcli)
+	defaultEventHandler = CreateLogManager(etcdcli)
+	shareHandler = &share.ServiceShareHandle{MQClient: mqClient, EtcdCli: etcdcli}
+	pluginShareHandler = &share.PluginShareHandle{MQClient: mqClient, EtcdCli: etcdcli}
 	if err := CreateTokenIdenHandler(conf); err != nil {
 		logrus.Errorf("create token identification mannager error, %v", err)
 		return err
 	}
+	defaultGatewayHandler = CreateGatewayManager(dbmanager, mqClient, etcdcli)
+	def3rdPartySvcHandler = Create3rdPartySvcHandler(dbmanager, statusCli)
+	operationHandler = CreateOperationHandler(mqClient)
+	batchOperationHandler = CreateBatchOperationHandler(mqClient, operationHandler)
+	defaultAppRestoreHandler = NewAppRestoreHandler()
+	defPodHandler = NewPodHandler(statusCli)
+	defClusterHandler = NewClusterHandler(kubeClient)
+
+	defaultVolumeTypeHandler = CreateVolumeTypeManger(statusCli)
+	defaultEtcdHandler = NewEtcdHandler(etcdcli)
+
 	return nil
 }
 
@@ -118,13 +116,6 @@ func GetRulesManager() NetRulesHandler {
 	return defaultNetRulesHandler
 }
 
-var defaultSourcesHandler SourcesHandler
-
-//GetSourcesManager get manager
-func GetSourcesManager() SourcesHandler {
-	return defaultSourcesHandler
-}
-
 var defaultCloudHandler CloudHandler
 
 //GetCloudManager get manager
@@ -151,4 +142,60 @@ var defaultAPPBackupHandler *group.BackupHandle
 //GetAPPBackupHandler GetAPPBackupHandler
 func GetAPPBackupHandler() *group.BackupHandle {
 	return defaultAPPBackupHandler
+}
+
+var defaultGatewayHandler GatewayHandler
+
+// GetGatewayHandler returns a default GatewayHandler
+func GetGatewayHandler() GatewayHandler {
+	return defaultGatewayHandler
+}
+
+var def3rdPartySvcHandler *ThirdPartyServiceHanlder
+
+// Get3rdPartySvcHandler returns the defalut ThirdParthServiceHanlder
+func Get3rdPartySvcHandler() *ThirdPartyServiceHanlder {
+	return def3rdPartySvcHandler
+}
+
+var batchOperationHandler *BatchOperationHandler
+
+//GetBatchOperationHandler get handler
+func GetBatchOperationHandler() *BatchOperationHandler {
+	return batchOperationHandler
+}
+
+var operationHandler *OperationHandler
+
+//GetOperationHandler get handler
+func GetOperationHandler() *OperationHandler {
+	return operationHandler
+}
+
+var defaultAppRestoreHandler AppRestoreHandler
+
+// GetAppRestoreHandler returns a default AppRestoreHandler
+func GetAppRestoreHandler() AppRestoreHandler {
+	return defaultAppRestoreHandler
+}
+
+var defPodHandler PodHandler
+
+// GetPodHandler returns the defalut PodHandler
+func GetPodHandler() PodHandler {
+	return defPodHandler
+}
+
+var defaultEtcdHandler *EtcdHandler
+
+// GetEtcdHandler returns the default etcd handler.
+func GetEtcdHandler() *EtcdHandler {
+	return defaultEtcdHandler
+}
+
+var defClusterHandler ClusterHandler
+
+// GetClusterHandler returns the default cluster handler.
+func GetClusterHandler() ClusterHandler {
+	return defClusterHandler
 }

@@ -19,17 +19,19 @@
 package callback
 
 import (
-	"github.com/Sirupsen/logrus"
+	"time"
+
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/discover"
 	"github.com/goodrain/rainbond/discover/config"
 	"github.com/goodrain/rainbond/monitor/prometheus"
-	"github.com/goodrain/rainbond/util/watch"
 	"github.com/goodrain/rainbond/monitor/utils"
+	"github.com/goodrain/rainbond/util/watch"
 	"github.com/prometheus/common/model"
-	"time"
 	"github.com/tidwall/gjson"
 )
 
+//Node node discover
 type Node struct {
 	discover.Callback
 	Prometheus      *prometheus.Manager
@@ -38,6 +40,7 @@ type Node struct {
 	endpoints []*config.Endpoint
 }
 
+//UpdateEndpoints update endpoints
 func (e *Node) UpdateEndpoints(endpoints ...*config.Endpoint) {
 	newArr := utils.TrimAndSort(endpoints)
 
@@ -48,25 +51,28 @@ func (e *Node) UpdateEndpoints(endpoints ...*config.Endpoint) {
 
 	e.sortedEndpoints = newArr
 
-	scrape := e.toScrape()
-	e.Prometheus.UpdateScrape(scrape)
+	scrapes := e.toScrape()
+	for _, scrape := range scrapes {
+		e.Prometheus.UpdateScrape(scrape)
+	}
 }
 
 func (e *Node) Error(err error) {
 	logrus.Error(err)
 }
 
+//Name name
 func (e *Node) Name() string {
 	return "rbd_node"
 }
 
-func (e *Node) toScrape() *prometheus.ScrapeConfig {
+func (e *Node) toScrape() []*prometheus.ScrapeConfig {
 	ts := make([]string, 0, len(e.sortedEndpoints))
 	for _, end := range e.sortedEndpoints {
 		ts = append(ts, end)
 	}
 
-	return &prometheus.ScrapeConfig{
+	return []*prometheus.ScrapeConfig{&prometheus.ScrapeConfig{
 		JobName:        e.Name(),
 		ScrapeInterval: model.Duration(30 * time.Second),
 		ScrapeTimeout:  model.Duration(30 * time.Second),
@@ -81,38 +87,65 @@ func (e *Node) toScrape() *prometheus.ScrapeConfig {
 				},
 			},
 		},
+	},
+		&prometheus.ScrapeConfig{
+			JobName:        "rbd_cluster",
+			ScrapeInterval: model.Duration(30 * time.Second),
+			ScrapeTimeout:  model.Duration(30 * time.Second),
+			MetricsPath:    "/cluster/metrics",
+			ServiceDiscoveryConfig: prometheus.ServiceDiscoveryConfig{
+				StaticConfigs: []*prometheus.Group{
+					{
+						Targets: ts,
+						Labels:  map[model.LabelName]model.LabelValue{},
+					},
+				},
+			},
+		},
 	}
 }
 
+//AddEndpoint add endpoint
 func (e *Node) AddEndpoint(end *config.Endpoint) {
 	e.endpoints = append(e.endpoints, end)
 	e.UpdateEndpoints(e.endpoints...)
 }
 
+//Add add
 func (e *Node) Add(event *watch.Event) {
-	url := gjson.Get(event.GetValueString(), "external_ip").String() + ":6100"
+	url := gjson.Get(event.GetValueString(), "internal_ip").String() + ":6100"
 	end := &config.Endpoint{
-		URL: url,
+		Name: event.GetKey(),
+		URL:  url,
 	}
-
 	e.AddEndpoint(end)
 }
 
+//Modify modify
 func (e *Node) Modify(event *watch.Event) {
+	var update bool
+	url := gjson.Get(event.GetValueString(), "internal_ip").String() + ":6100"
 	for i, end := range e.endpoints {
-		if end.URL == event.GetValueString() {
-			url := gjson.Get(event.GetValueString(), "external_ip").String() + ":6100"
+		if end.Name == event.GetKey() {
 			e.endpoints[i].URL = url
 			e.UpdateEndpoints(e.endpoints...)
+			update = true
 			break
 		}
 	}
+	if !update {
+		e.endpoints = append(e.endpoints, &config.Endpoint{
+			Name: event.GetKey(),
+			URL:  url,
+		})
+		e.UpdateEndpoints(e.endpoints...)
+	}
 }
 
+//Delete delete
 func (e *Node) Delete(event *watch.Event) {
 	for i, end := range e.endpoints {
-		url := gjson.Get(event.GetValueString(), "external_ip").String() + ":6100"
-		if end.URL == url {
+		if end.Name == event.GetKey() {
 			e.endpoints = append(e.endpoints[:i], e.endpoints[i+1:]...)
 			e.UpdateEndpoints(e.endpoints...)
 			break

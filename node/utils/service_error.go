@@ -19,11 +19,11 @@
 package utils
 
 import (
-	httputil "github.com/goodrain/rainbond/util/http"
 	"fmt"
+	httputil "github.com/goodrain/rainbond/util/http"
 	"net/http"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 //APIHandleError handle create err for api

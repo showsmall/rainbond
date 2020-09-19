@@ -25,11 +25,12 @@ import (
 	"net/url"
 	"reflect"
 
-	"golang.org/x/net/context"
+	"github.com/goodrain/rainbond/api/util/bcode"
 
 	"github.com/go-chi/render"
-
-	govalidator "github.com/thedevsaddam/govalidator"
+	govalidator "github.com/goodrain/rainbond/util/govalidator"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/context"
 )
 
 //ValidatorStructRequest 验证请求数据
@@ -121,6 +122,7 @@ func ParseResponseBody(red io.ReadCloser, dataType string) (re ResponseBody, err
 
 //ReturnValidationError 参数错误返回
 func ReturnValidationError(r *http.Request, w http.ResponseWriter, err url.Values) {
+	logrus.Debugf("validation error, uri: %s; msg: %v", r.RequestURI, ResponseBody{ValidationError: err})
 	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, http.StatusBadRequest))
 	render.DefaultResponder(w, r, ResponseBody{ValidationError: err})
 }
@@ -141,14 +143,15 @@ func ReturnSuccess(r *http.Request, w http.ResponseWriter, datas interface{}) {
 	return
 }
 
-//ReturnList 返回列表
-func ReturnList(r *http.Request, w http.ResponseWriter, listAllNumber, page int, datas ...interface{}) {
+//ReturnList return list with page and count
+func ReturnList(r *http.Request, w http.ResponseWriter, listAllNumber, page int, list interface{}) {
 	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, http.StatusOK))
-	render.DefaultResponder(w, r, ResponseBody{List: datas, ListAllNumber: listAllNumber, Page: page})
+	render.DefaultResponder(w, r, ResponseBody{List: list, ListAllNumber: listAllNumber, Page: page})
 }
 
 //ReturnError 返回错误信息
 func ReturnError(r *http.Request, w http.ResponseWriter, code int, msg string) {
+	logrus.Debugf("error code: %d; error uri: %s; error msg: %s", code, r.RequestURI, msg)
 	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, code))
 	render.DefaultResponder(w, r, ResponseBody{Msg: msg})
 }
@@ -157,4 +160,25 @@ func ReturnError(r *http.Request, w http.ResponseWriter, code int, msg string) {
 func Return(r *http.Request, w http.ResponseWriter, code int, reb ResponseBody) {
 	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, code))
 	render.DefaultResponder(w, r, reb)
+}
+
+//ReturnNoFomart  http return no format result
+func ReturnNoFomart(r *http.Request, w http.ResponseWriter, code int, reb interface{}) {
+	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, code))
+	render.DefaultResponder(w, r, reb)
+}
+
+//ReturnResNotEnough http return node resource not enough, http code = 412
+func ReturnResNotEnough(r *http.Request, w http.ResponseWriter, msg string) {
+	logrus.Debugf("resource not enough, msg: %s", msg)
+	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, 412))
+	render.DefaultResponder(w, r, ResponseBody{Msg: msg})
+}
+
+//ReturnBcodeError bcode error
+func ReturnBcodeError(r *http.Request, w http.ResponseWriter, err error) {
+	berr := bcode.Err2Coder(err)
+	logrus.Debugf("path %s error code: %d; status: %d; error msg: %s", r.RequestURI, berr.GetCode(), berr.GetStatus(), berr.Error())
+	r = r.WithContext(context.WithValue(r.Context(), render.StatusCtxKey, berr.GetStatus()))
+	render.DefaultResponder(w, r, berr)
 }

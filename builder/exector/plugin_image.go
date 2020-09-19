@@ -22,55 +22,54 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goodrain/rainbond/builder"
+	"github.com/goodrain/rainbond/builder/model"
 	"github.com/goodrain/rainbond/builder/sources"
-
 	"github.com/goodrain/rainbond/db"
 	"github.com/goodrain/rainbond/event"
-
+	"github.com/goodrain/rainbond/mq/api/grpc/pb"
 	"github.com/pquerna/ffjson/ffjson"
 
-	"github.com/goodrain/rainbond/builder/model"
-
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
-func (e *exectorManager) pluginImageBuild(in []byte) {
+func (e *exectorManager) pluginImageBuild(task *pb.TaskMessage) {
 	var tb model.BuildPluginTaskBody
-	if err := ffjson.Unmarshal(in, &tb); err != nil {
+	if err := ffjson.Unmarshal(task.TaskBody, &tb); err != nil {
 		logrus.Errorf("unmarshal taskbody error, %v", err)
 		return
 	}
 	eventID := tb.EventID
 	logger := event.GetManager().GetLogger(eventID)
 	logger.Info("从镜像构建插件任务开始执行", map[string]string{"step": "builder-exector", "status": "starting"})
-	go func() {
-		logrus.Info("start exec build plugin from image worker")
-		defer event.GetManager().ReleaseLogger(logger)
-		for retry := 0; retry < 2; retry++ {
-			err := e.run(&tb, logger)
-			if err != nil {
-				logrus.Errorf("exec plugin build from image error:%s", err.Error())
-				logger.Info("镜像构建插件任务执行失败，开始重试", map[string]string{"step": "builder-exector", "status": "failure"})
-			} else {
-				return
-			}
-		}
-		version, err := db.GetManager().TenantPluginBuildVersionDao().GetBuildVersionByDeployVersion(tb.PluginID, tb.VersionID, tb.DeployVersion)
+
+	logrus.Info("start exec build plugin from image worker")
+	defer event.GetManager().ReleaseLogger(logger)
+	for retry := 0; retry < 2; retry++ {
+		err := e.run(&tb, logger)
 		if err != nil {
-			logrus.Errorf("get version error, %v", err)
+			logrus.Errorf("exec plugin build from image error:%s", err.Error())
+			logger.Info("镜像构建插件任务执行失败，开始重试", map[string]string{"step": "builder-exector", "status": "failure"})
+		} else {
 			return
 		}
-		version.Status = "failure"
-		if err := db.GetManager().TenantPluginBuildVersionDao().UpdateModel(version); err != nil {
-			logrus.Errorf("update version error, %v", err)
-		}
-		logger.Info("镜像构建插件任务执行失败", map[string]string{"step": "callback", "status": "failure"})
-	}()
+	}
+	version, err := db.GetManager().TenantPluginBuildVersionDao().GetBuildVersionByDeployVersion(tb.PluginID, tb.VersionID, tb.DeployVersion)
+	if err != nil {
+		logrus.Errorf("get version error, %v", err)
+		return
+	}
+	version.Status = "failure"
+	if err := db.GetManager().TenantPluginBuildVersionDao().UpdateModel(version); err != nil {
+		logrus.Errorf("update version error, %v", err)
+	}
+	MetricErrorTaskNum++
+	logger.Info("镜像构建插件任务执行失败", map[string]string{"step": "callback", "status": "failure"})
 }
 
 func (e *exectorManager) run(t *model.BuildPluginTaskBody, logger event.Logger) error {
-
-	if _, err := sources.ImagePull(e.DockerClient, t.ImageURL, t.ImageInfo.HubUser, t.ImageInfo.HubPassword, logger, 10); err != nil {
+	hubUser, hubPass := builder.GetImageUserInfo(t.ImageInfo.HubUser, t.ImageInfo.HubPassword)
+	if _, err := sources.ImagePull(e.DockerClient, t.ImageURL, hubUser, hubPass, logger, 10); err != nil {
 		logrus.Errorf("pull image %v error, %v", t.ImageURL, err)
 		logger.Error("拉取镜像失败", map[string]string{"step": "builder-exector", "status": "failure"})
 		return err
@@ -84,7 +83,7 @@ func (e *exectorManager) run(t *model.BuildPluginTaskBody, logger event.Logger) 
 		return err
 	}
 	logger.Info("修改镜像Tag完成", map[string]string{"step": "build-exector", "status": "complete"})
-	if err := sources.ImagePush(e.DockerClient, newTag, "", "", logger, 10); err != nil {
+	if err := sources.ImagePush(e.DockerClient, newTag, builder.REGISTRYUSER, builder.REGISTRYPASS, logger, 10); err != nil {
 		logrus.Errorf("push image %s error, %v", newTag, err)
 		logger.Error("推送镜像失败", map[string]string{"step": "builder-exector", "status": "failure"})
 		return err
@@ -117,7 +116,7 @@ func createPluginImageTag(image string, pluginid, version string) string {
 		iName = image
 	}
 	if strings.HasPrefix(iName, "plugin") {
-		return fmt.Sprintf("goodrain.me/%s:%s_%s", iName, pluginid, version)
+		return fmt.Sprintf("%s/%s:%s_%s", builder.REGISTRYDOMAIN, iName, pluginid, version)
 	}
-	return fmt.Sprintf("goodrain.me/plugin_%s_%s:%s_%s", iName, pluginid, tag, version)
+	return fmt.Sprintf("%s/plugin_%s_%s:%s_%s", builder.REGISTRYDOMAIN, iName, pluginid, tag, version)
 }

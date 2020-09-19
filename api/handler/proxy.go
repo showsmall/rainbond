@@ -19,30 +19,36 @@
 package handler
 
 import (
-	"github.com/goodrain/rainbond/cmd/api/option"
 	"github.com/goodrain/rainbond/api/discover"
 	"github.com/goodrain/rainbond/api/proxy"
+	"github.com/goodrain/rainbond/cmd/api/option"
 )
 
 var nodeProxy proxy.Proxy
 var builderProxy proxy.Proxy
 var prometheusProxy proxy.Proxy
+var monitorProxy proxy.Proxy
+var kubernetesDashboard proxy.Proxy
 
 //InitProxy 初始化
 func InitProxy(conf option.Config) {
 	if nodeProxy == nil {
 		nodeProxy = proxy.CreateProxy("acp_node", "http", conf.NodeAPI)
-		discover.GetEndpointDiscover(conf.EtcdEndpoint).AddProject("acp_node", nodeProxy)
+		discover.GetEndpointDiscover().AddProject("acp_node", nodeProxy)
 	}
 	if builderProxy == nil {
 		builderProxy = proxy.CreateProxy("builder", "http", conf.BuilderAPI)
-		discover.GetEndpointDiscover(conf.EtcdEndpoint).AddProject("builder", builderProxy)
 	}
 	if prometheusProxy == nil {
-		prometheusProxy = proxy.CreateProxy("prometheus", "http", []string{"127.0.0.1:9999"})
-		discover.GetEndpointDiscover(conf.EtcdEndpoint).AddProject("prometheus", prometheusProxy)
+		prometheusProxy = proxy.CreateProxy("prometheus", "http", []string{"rbd-monitor:9999"})
 	}
-
+	if monitorProxy == nil {
+		monitorProxy = proxy.CreateProxy("monitor", "http", []string{"127.0.0.1:3329"})
+		discover.GetEndpointDiscover().AddProject("monitor", monitorProxy)
+	}
+	if kubernetesDashboard == nil {
+		kubernetesDashboard = proxy.CreateProxy("kubernetesdashboard", "http", []string{conf.KuberentesDashboardAPI})
+	}
 }
 
 //GetNodeProxy GetNodeProxy
@@ -58,4 +64,14 @@ func GetBuilderProxy() proxy.Proxy {
 //GetPrometheusProxy GetPrometheusProxy
 func GetPrometheusProxy() proxy.Proxy {
 	return prometheusProxy
+}
+
+//GetMonitorProxy GetMonitorProxy
+func GetMonitorProxy() proxy.Proxy {
+	return monitorProxy
+}
+
+// GetKubernetesDashboardProxy returns the kubernetes dashboard proxy.
+func GetKubernetesDashboardProxy() proxy.Proxy {
+	return kubernetesDashboard
 }

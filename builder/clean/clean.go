@@ -21,15 +21,14 @@ package clean
 import (
 	"context"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	"github.com/goodrain/rainbond/db"
 	"github.com/goodrain/rainbond/util"
 
-	"github.com/docker/engine-api/client"
+	"github.com/docker/docker/client"
 	"github.com/goodrain/rainbond/builder/sources"
 )
 
@@ -57,6 +56,7 @@ func CreateCleanManager() (*Manager, error) {
 
 //Start start clean
 func (t *Manager) Start(errchan chan error) error {
+	logrus.Info("CleanManager is starting.")
 	run := func() {
 		err := util.Exec(t.ctx, func() error {
 			now := time.Now()
@@ -76,34 +76,31 @@ func (t *Manager) Start(errchan chan error) error {
 			}
 
 			for _, v := range versions {
+				versions, err := db.GetManager().VersionInfoDao().GetVersionByServiceID(v.ServiceID)
+				if err != nil {
+					logrus.Error("GetVersionByServiceID error: ", err.Error())
+					continue
+				}
+				if len(versions) <= 5 {
+					continue
+				}
 				if v.DeliveredType == "image" {
 					imagePath := v.DeliveredPath
-					err := sources.ImageRemove(t.dclient, imagePath) //remove image
+					//remove local image, However, it is important to note that the version image is stored in the image repository
+					err := sources.ImageRemove(t.dclient, imagePath)
 					if err != nil {
-						if strings.Contains(err.Error(), "No such image") {
-							logrus.Error(err)
-						} else {
-							logrus.Error(err)
-							continue
-						}
+						logrus.Error(err)
 					}
 					if err := db.GetManager().VersionInfoDao().DeleteVersionInfo(v); err != nil {
 						logrus.Error(err)
 						continue
 					}
 					logrus.Info("Image deletion successful:", imagePath)
-
 				}
 				if v.DeliveredType == "slug" {
 					filePath := v.DeliveredPath
 					if err := os.Remove(filePath); err != nil {
-						if strings.Contains(err.Error(), "no such file or directory") {
-							logrus.Error(err)
-						} else {
-							logrus.Error(err)
-							continue
-
-						}
+						logrus.Error(err)
 					}
 					if err := db.GetManager().VersionInfoDao().DeleteVersionInfo(v); err != nil {
 						logrus.Error(err)

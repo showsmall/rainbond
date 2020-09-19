@@ -22,10 +22,13 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/goodrain/rainbond/worker/master"
+
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/cmd/worker/option"
-	status "github.com/goodrain/rainbond/appruntimesync/client"
-	"github.com/goodrain/rainbond/worker/monitor/cache"
+	httputil "github.com/goodrain/rainbond/util/http"
+	"github.com/goodrain/rainbond/worker/appm/controller"
+	"github.com/goodrain/rainbond/worker/discover"
 	"github.com/goodrain/rainbond/worker/monitor/collector"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -34,30 +37,29 @@ import (
 
 //ExporterManager app resource exporter
 type ExporterManager struct {
-	ctx           context.Context
-	cancel        context.CancelFunc
-	config        option.Config
-	stopChan      chan struct{}
-	statusManager *status.AppRuntimeSyncClient
-	cache         *cache.DiskCache
+	ctx               context.Context
+	cancel            context.CancelFunc
+	config            option.Config
+	stopChan          chan struct{}
+	masterController  *master.Controller
+	controllermanager *controller.Manager
 }
 
 //NewManager return *NewManager
-func NewManager(c option.Config, statusManager *status.AppRuntimeSyncClient) *ExporterManager {
+func NewManager(c option.Config, masterController *master.Controller, controllermanager *controller.Manager) *ExporterManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	cache := cache.CreatDiskCache(ctx, statusManager)
 	return &ExporterManager{
-		ctx:           ctx,
-		cancel:        cancel,
-		config:        c,
-		stopChan:      make(chan struct{}),
-		statusManager: statusManager,
-		cache:         cache,
+		ctx:               ctx,
+		cancel:            cancel,
+		config:            c,
+		stopChan:          make(chan struct{}),
+		masterController:  masterController,
+		controllermanager: controllermanager,
 	}
 }
 func (t *ExporterManager) handler(w http.ResponseWriter, r *http.Request) {
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(collector.New(t.statusManager, t.cache))
+	registry.MustRegister(collector.New(t.masterController, t.controllermanager))
 
 	gatherers := prometheus.Gatherers{
 		prometheus.DefaultGatherer,
@@ -81,7 +83,13 @@ func (t *ExporterManager) Start() error {
 			</html>
 			`))
 	})
-	go t.cache.Start()
+	http.HandleFunc("/worker/health", func(w http.ResponseWriter, r *http.Request) {
+		healthStatus := discover.HealthCheck()
+		if healthStatus["status"] != "health" {
+			httputil.ReturnError(r, w, 400, "worker service unusual")
+		}
+		httputil.ReturnSuccess(r, w, healthStatus)
+	})
 	log.Infoln("Listening on", t.config.Listen)
 	go func() {
 		log.Fatal(http.ListenAndServe(t.config.Listen, nil))

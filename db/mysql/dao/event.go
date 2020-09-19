@@ -19,10 +19,10 @@
 package dao
 
 import (
-	"encoding/json"
+	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/db/model"
 	"github.com/jinzhu/gorm"
 )
@@ -44,42 +44,15 @@ func (c *EventDaoImpl) AddModel(mo model.Interface) error {
 
 //UpdateModel UpdateModel
 func (c *EventDaoImpl) UpdateModel(mo model.Interface) error {
-	result := mo.(*model.ServiceEvent)
-
+	update := mo.(*model.ServiceEvent)
 	var oldResult model.ServiceEvent
-	if ok := c.DB.Where("event_id=?", result.EventID).Find(&oldResult).RecordNotFound(); !ok {
-		finalUpdateEvent(result, &oldResult)
-		oldB, _ := json.Marshal(oldResult)
-		logrus.Infof("update event to %s", string(oldB))
-		if err := c.DB.Save(&oldResult).Error; err != nil {
+	if ok := c.DB.Where("event_id=?", update.EventID).Find(&oldResult).RecordNotFound(); !ok {
+		update.ID = oldResult.ID
+		if err := c.DB.Save(&update).Error; err != nil {
 			return err
 		}
 	}
 	return nil
-}
-func finalUpdateEvent(target *model.ServiceEvent, old *model.ServiceEvent) {
-	if target.CodeVersion != "" {
-		old.CodeVersion = target.CodeVersion
-	}
-	if target.OptType != "" {
-		old.OptType = target.OptType
-	}
-
-	if target.Status != "" {
-		old.Status = target.Status
-	}
-	if target.Message != "" {
-		old.Message = target.Message
-	}
-	old.FinalStatus = "complete"
-	if target.FinalStatus != "" {
-		old.FinalStatus = target.FinalStatus
-	}
-
-	old.EndTime = time.Now().String()
-	if old.Status == "failure" && old.OptType == "callback" {
-		old.DeployVersion = old.OldDeployVersion
-	}
 }
 
 //EventDaoImpl EventLogMessageDaoImpl
@@ -113,24 +86,107 @@ func (c *EventDaoImpl) GetEventByServiceID(serviceID string) ([]*model.ServiceEv
 	var result []*model.ServiceEvent
 	if err := c.DB.Where("service_id=?", serviceID).Find(&result).Order("start_time DESC").Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
-			//return messageRaw, nil
+			return result, nil
 		}
 		return nil, err
 	}
 	return result, nil
 }
 
-//GetEventByServiceID delete event log
-func (c *EventDaoImpl) DelEventByServiceID(serviceID string) (error) {
-	var result  []*model.ServiceEvent
+//DelEventByServiceID delete event log
+func (c *EventDaoImpl) DelEventByServiceID(serviceID string) error {
+	var result []*model.ServiceEvent
 	isNoteExist := c.DB.Where("service_id=?", serviceID).Find(&result).RecordNotFound()
-	if isNoteExist{
+	if isNoteExist {
 		return nil
 	}
-	if err := c.DB.Where("service_id=?", serviceID).Delete(result).Error;err!= nil{
+	if err := c.DB.Where("service_id=?", serviceID).Delete(result).Error; err != nil {
 		return err
 	}
 	return nil
+}
+
+// ListByTargetID -
+func (c *EventDaoImpl) ListByTargetID(targetID string) ([]*model.ServiceEvent, error) {
+	var events []*model.ServiceEvent
+	if err := c.DB.Where("target_id=?", targetID).Find(&events).Error; err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// GetEventsByTarget get event by target with page
+func (c *EventDaoImpl) GetEventsByTarget(target, targetID string, offset, limit int) ([]*model.ServiceEvent, int, error) {
+	var result []*model.ServiceEvent
+	var total int
+	db := c.DB
+	if target != "" && targetID != "" {
+		// Compatible with previous 5.1.7 data, with null target and targetid
+		if strings.TrimSpace(target) == "service" {
+			db = db.Where("service_id=? or (target=? and target_id=?) ", strings.TrimSpace(targetID), strings.TrimSpace(target), strings.TrimSpace(targetID))
+		} else {
+			db = db.Where("target=? and target_id=?", strings.TrimSpace(target), strings.TrimSpace(targetID))
+		}
+	}
+	if err := db.Model(&model.ServiceEvent{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if err := db.Offset(offset).Limit(limit).Order("create_time DESC").Find(&result).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return result, 0, nil
+		}
+		return nil, 0, err
+	}
+
+	return result, total, nil
+}
+
+// GetEventsByTenantID get event by tenantID
+func (c *EventDaoImpl) GetEventsByTenantID(tenantID string, offset, limit int) ([]*model.ServiceEvent, int, error) {
+	var result []*model.ServiceEvent
+	var total int
+	start := time.Now()
+	if err := c.DB.Model(&model.ServiceEvent{}).Where("tenant_id=?", tenantID).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	logrus.Debugf("query event count %d take time %s", total, time.Now().Sub(start))
+	if err := c.DB.Where("tenant_id=?", tenantID).Offset(offset).Limit(limit).Order("start_time DESC").Find(&result).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return result, 0, nil
+		}
+		return nil, 0, err
+	}
+	logrus.Debugf("query event list take time %s", time.Now().Sub(start))
+	return result, total, nil
+}
+
+//GetLastASyncEvent get last sync event
+func (c *EventDaoImpl) GetLastASyncEvent(target, targetID string) (*model.ServiceEvent, error) {
+	var result model.ServiceEvent
+	if err := c.DB.Where("target=? and target_id=? and syn_type=0", target, targetID).Last(&result).Error; err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// UnfinishedEvents returns unfinished events.
+func (c *EventDaoImpl) UnfinishedEvents(target, targetID string, optTypes ...string) ([]*model.ServiceEvent, error) {
+	var result []*model.ServiceEvent
+	if err := c.DB.Where("target=? and target_id=? and status=? and opt_type in (?)", target, targetID, model.EventStatusFailure.String(), optTypes).
+		Find(&result).Error; err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// LatestFailurePodEvent returns the latest failure pod event.
+func (c *EventDaoImpl) LatestFailurePodEvent(podName string) (*model.ServiceEvent, error) {
+	var event model.ServiceEvent
+	if err := c.DB.Where("target=? and target_id=? and status=? and final_status<>?", model.TargetTypePod, podName, model.EventStatusFailure.String(), model.EventFinalStatusEmptyComplete.String()).
+		Last(&event).Error; err != nil {
+		return nil, err
+	}
+	return &event, nil
 }
 
 //NotificationEventDaoImpl NotificationEventDaoImpl
@@ -143,13 +199,13 @@ func (c *NotificationEventDaoImpl) AddModel(mo model.Interface) error {
 	result := mo.(*model.NotificationEvent)
 	result.LastTime = time.Now()
 	result.FirstTime = time.Now()
+	result.CreatedAt = time.Now()
 	var oldResult model.NotificationEvent
-	if ok := c.DB.Where("hash=?", result.Hash).Find(&oldResult).RecordNotFound(); ok {
+	if ok := c.DB.Where("hash = ?", result.Hash).Find(&oldResult).RecordNotFound(); ok {
 		if err := c.DB.Create(result).Error; err != nil {
 			return err
 		}
 	} else {
-		logrus.Infoln("event result is exist")
 		return c.UpdateModel(mo)
 	}
 	return nil
@@ -159,11 +215,12 @@ func (c *NotificationEventDaoImpl) AddModel(mo model.Interface) error {
 func (c *NotificationEventDaoImpl) UpdateModel(mo model.Interface) error {
 	result := mo.(*model.NotificationEvent)
 	var oldResult model.NotificationEvent
-	if ok := c.DB.Where("hash=?", result.Hash).Find(&oldResult).RecordNotFound(); !ok {
+	if ok := c.DB.Where("hash = ?", result.Hash).Find(&oldResult).RecordNotFound(); !ok {
 		result.FirstTime = oldResult.FirstTime
 		result.ID = oldResult.ID
+		return c.DB.Save(result).Error
 	}
-	return c.DB.Save(result).Error
+	return gorm.ErrRecordNotFound
 }
 
 //GetNotificationEventByKind GetNotificationEventByKind
@@ -182,7 +239,7 @@ func (c *NotificationEventDaoImpl) GetNotificationEventByKind(kind, kindID strin
 func (c *NotificationEventDaoImpl) GetNotificationEventByTime(start, end time.Time) ([]*model.NotificationEvent, error) {
 	var result []*model.NotificationEvent
 	if !start.IsZero() && !end.IsZero() {
-		if err := c.DB.Where("last_time>? and last_time<?", start, end).Find(&result).Order("last_time DESC").Error; err != nil {
+		if err := c.DB.Where("last_time>? and last_time<? and is_handle=?", start, end, 0).Find(&result).Order("last_time DESC").Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				return result, nil
 			}
@@ -190,7 +247,7 @@ func (c *NotificationEventDaoImpl) GetNotificationEventByTime(start, end time.Ti
 		}
 		return result, nil
 	}
-	if err := c.DB.Where("last_time<?", time.Now()).Find(&result).Order("last_time DESC").Error; err != nil {
+	if err := c.DB.Where("last_time<? and is_handle=?", time.Now(), 0).Find(&result).Order("last_time DESC").Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return result, nil
 		}

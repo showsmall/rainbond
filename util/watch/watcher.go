@@ -22,8 +22,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	"github.com/coreos/etcd/clientv3"
 	etcdrpc "github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
@@ -158,31 +159,54 @@ func (wc *watchChan) startWatching(watchClosedCh chan struct{}) {
 		if err := wc.sync(); err != nil {
 			logrus.Errorf("failed to sync with latest state: %v", err)
 			wc.sendError(err)
+			close(watchClosedCh)
 			return
 		}
 	}
-	opts := []clientv3.OpOption{clientv3.WithRev(wc.initialRev + 1), clientv3.WithPrevKV()}
+	opts := []clientv3.OpOption{
+		clientv3.WithRev(wc.initialRev + 1),
+		clientv3.WithPrevKV(),
+	}
 	if wc.recursive {
 		opts = append(opts, clientv3.WithPrefix())
 	}
-	wch := wc.watcher.client.Watch(wc.ctx, wc.key, opts...)
-	for wres := range wch {
-		if wres.Err() != nil {
-			err := wres.Err()
-			// If there is an error on server (e.g. compaction), the channel will return it before closed.
-			logrus.Errorf("watch chan error: %v", err)
-			wc.sendError(err)
-			return
+	ctx, cancel := context.WithCancel(wc.ctx)
+	defer cancel()
+	wch := wc.watcher.client.Watch(ctx, wc.key, opts...)
+	err := func() error {
+		timer := time.NewTimer(time.Second * 20)
+		defer timer.Stop()
+		for {
+			select {
+			case wres := <-wch:
+				if err := wres.Err(); err != nil {
+					// If there is an error on server (e.g. compaction), the channel will return it before closed.
+					logrus.Errorf("watch chan error: %v", err)
+					wc.sendError(err)
+					close(watchClosedCh)
+					return err
+				}
+				logrus.Debugf("watch event %+v", wres)
+				// If you return a structure with no events
+				// It is considered that this watch is no longer effective
+				// Return nil redo watch
+				if len(wres.Events) == 0 {
+					return nil
+				}
+				for _, e := range wres.Events {
+					wc.sendEvent(parseEvent(e))
+				}
+				timer.Reset(time.Second * 20)
+			case <-timer.C:
+				return nil
+			}
 		}
-		for _, e := range wres.Events {
-			wc.sendEvent(parseEvent(e))
-		}
+	}()
+	if err == nil {
+		wc.initialRev = 0
+		logrus.Debugf("watcher sync, because of not updated for a long time")
+		go wc.startWatching(watchClosedCh)
 	}
-	// When we come to this point, it's only possible that client side ends the watch.
-	// e.g. cancel the context, close the client.
-	// If this watch chan is broken and context isn't cancelled, other goroutines will still hang.
-	// We should notify the main thread that this goroutine has exited.
-	close(watchClosedCh)
 }
 
 // processEvent processes events from etcd watcher and sends results to resultChan.
@@ -216,6 +240,9 @@ func (wc *watchChan) processEvent(wg *sync.WaitGroup) {
 
 // transform transforms an event into a result for user if not filtered.
 func (wc *watchChan) transform(e *event) (res *Event) {
+	if e == nil {
+		return nil
+	}
 	switch {
 	case e.isDeleted:
 		res = &Event{

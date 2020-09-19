@@ -25,7 +25,7 @@ import (
 
 	"github.com/goodrain/rainbond/mq/api/mq"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	discovermodel "github.com/goodrain/rainbond/worker/discover/model"
 
@@ -152,6 +152,7 @@ func (u *MQSource) enqueue(request *restful.Request, response *restful.Response)
 		NewFaliResponse(400, "request body error."+err.Error(), "读取数据错误，数据不合法", response)
 		return
 	}
+
 	ctx, cancel := context.WithCancel(request.Request.Context())
 	defer cancel()
 	err = u.mq.Enqueue(ctx, topic, string(body))

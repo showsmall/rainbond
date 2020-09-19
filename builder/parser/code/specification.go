@@ -43,6 +43,10 @@ func init() {
 	specification = make(map[Lang]func(buildPath string) Specification)
 	specification[JavaJar] = javaJarCheck
 	specification[JavaMaven] = javaMavenCheck
+	specification[PHP] = phpCheck
+	specification[NodeJSStatic] = nodeCheck
+	specification[Nodejs] = nodeCheck
+	specification[Golang] = golangCheck
 }
 
 //CheckCodeSpecification 检查语言规范
@@ -86,8 +90,12 @@ func javaMavenCheck(buildPath string) Specification {
 			Noconform: map[string]string{"识别为JavaMaven语言，工作目录未发现pom.xml文件": "定义pom.xml文件"},
 		}
 	}
+	ok := util.SearchFileBody(path.Join(buildPath, "pom.xml"), "<modules>")
+	if ok {
+		return common()
+	}
 	//判断pom.xml中是否包含 org.springframework.boot定义
-	ok := util.SearchFileBody(path.Join(buildPath, "pom.xml"), "org.springframework.boot")
+	ok = util.SearchFileBody(path.Join(buildPath, "pom.xml"), "org.springframework.boot")
 	if !ok {
 		//默认只能打包成war包
 		war := util.SearchFileBody(path.Join(buildPath, "pom.xml"), "<packaging>war</packaging>")
@@ -131,4 +139,34 @@ func common() Specification {
 	return Specification{
 		Conform: true,
 	}
+}
+
+func phpCheck(buildPath string) Specification {
+	if ok, _ := util.FileExists(path.Join(buildPath, "composer.lock")); !ok {
+		return Specification{
+			Conform:   false,
+			Noconform: map[string]string{"识别为PHP语言，代码目录未发现composer.lock文件": "必须生成composer.lock文件"},
+		}
+	}
+	return common()
+}
+func nodeCheck(buildPath string) Specification {
+	var yarn, npm bool
+	if ok, _ := util.FileExists(path.Join(buildPath, "yarn.lock")); ok {
+		yarn = true
+	}
+	if ok, _ := util.FileExists(path.Join(buildPath, "package-lock.json")); ok {
+		npm = true
+	}
+	if !yarn && !npm {
+		return Specification{
+			Conform:   false,
+			Noconform: map[string]string{"代码目录未发现yarn.lock或package-lock.json文件": "必须生成并提交yarn.lock或package-lock.json文件"},
+		}
+	}
+	return common()
+}
+
+func golangCheck(buildPath string) Specification {
+	return common()
 }

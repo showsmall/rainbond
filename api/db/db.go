@@ -22,20 +22,19 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/sirupsen/logrus"
+	tsdbClient "github.com/bluebreezecf/opentsdb-goclient/client"
+	tsdbConfig "github.com/bluebreezecf/opentsdb-goclient/config"
 	"github.com/goodrain/rainbond/cmd/api/option"
 	"github.com/goodrain/rainbond/db"
 	"github.com/goodrain/rainbond/db/config"
+	dbModel "github.com/goodrain/rainbond/db/model"
 	"github.com/goodrain/rainbond/event"
-	"github.com/goodrain/rainbond/mq/api/grpc/client"
 	"github.com/goodrain/rainbond/mq/api/grpc/pb"
+	"github.com/goodrain/rainbond/mq/client"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
 	"github.com/goodrain/rainbond/worker/discover/model"
-
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
-
-	"github.com/Sirupsen/logrus"
-	tsdbClient "github.com/bluebreezecf/opentsdb-goclient/client"
-	tsdbConfig "github.com/bluebreezecf/opentsdb-goclient/config"
+	"github.com/jinzhu/gorm"
 )
 
 //ConDB struct
@@ -45,28 +44,19 @@ type ConDB struct {
 }
 
 //CreateDBManager get db manager
-//TODO: need to try when happend error, try 4 times
+//TODO: need to try when happened error, try 4 times
 func CreateDBManager(conf option.Config) error {
-	var tryTime time.Duration
-	tryTime = 0
-	var err error
-	for tryTime < 4 {
-		tryTime++
-		if err = db.CreateManager(config.Config{
-			MysqlConnectionInfo: conf.DBConnectionInfo,
-			DBType:              conf.DBType,
-		}); err != nil {
-			logrus.Errorf("get db manager failed, try time is %v,%s", tryTime, err.Error())
-			time.Sleep((5 + tryTime*10) * time.Second)
-		} else {
-			break
-		}
+	dbCfg := config.Config{
+		MysqlConnectionInfo: conf.DBConnectionInfo,
+		DBType:              conf.DBType,
 	}
-	if err != nil {
+	if err := db.CreateManager(dbCfg); err != nil {
 		logrus.Errorf("get db manager failed,%s", err.Error())
 		return err
 	}
-	logrus.Debugf("init db manager success")
+	// api database initialization
+	go dataInitialization()
+
 	return nil
 }
 
@@ -75,18 +65,23 @@ func CreateEventManager(conf option.Config) error {
 	var tryTime time.Duration
 	tryTime = 0
 	var err error
+	etcdClientArgs := &etcdutil.ClientArgs{
+		Endpoints: conf.EtcdEndpoint,
+		CaFile:    conf.EtcdCaFile,
+		CertFile:  conf.EtcdCertFile,
+		KeyFile:   conf.EtcdKeyFile,
+	}
 	for tryTime < 4 {
 		tryTime++
 		if err = event.NewManager(event.EventConfig{
 			EventLogServers: conf.EventLogServers,
-			DiscoverAddress: conf.EtcdEndpoint,
+			DiscoverArgs:    etcdClientArgs,
 		}); err != nil {
 			logrus.Errorf("get event manager failed, try time is %v,%s", tryTime, err.Error())
 			time.Sleep((5 + tryTime*10) * time.Second)
 		} else {
 			break
 		}
-		//defer event.CloseManager()
 	}
 	if err != nil {
 		logrus.Errorf("get event manager failed. %v", err.Error())
@@ -98,40 +93,18 @@ func CreateEventManager(conf option.Config) error {
 
 //MQManager mq manager
 type MQManager struct {
-	EtcdEndpoint  []string
-	DefaultServer string
+	EtcdClientArgs *etcdutil.ClientArgs
+	DefaultServer  string
 }
 
 //NewMQManager new mq manager
-func (m *MQManager) NewMQManager() (*client.MQClient, error) {
-	client, err := client.NewMqClient(m.EtcdEndpoint, m.DefaultServer)
+func (m *MQManager) NewMQManager() (client.MQClient, error) {
+	client, err := client.NewMqClient(m.EtcdClientArgs, m.DefaultServer)
 	if err != nil {
 		logrus.Errorf("new mq manager error, %v", err)
 		return client, err
 	}
 	return client, nil
-}
-
-//K8SManager struct
-type K8SManager struct {
-	K8SConfig string
-}
-
-//NewKubeConnection new k8s config path
-func (k *K8SManager) NewKubeConnection() (*kubernetes.Clientset, error) {
-	kubeconfig := k.K8SConfig
-	conf, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		return nil, err
-	}
-	conf.QPS = 50
-	conf.Burst = 100
-	// creates the clientset
-	clientset, err := kubernetes.NewForConfig(conf)
-	if err != nil {
-		return clientset, err
-	}
-	return clientset, nil
 }
 
 //TaskStruct task struct
@@ -176,22 +149,104 @@ func BuildTask(t *TaskStruct) (*pb.EnqueueRequest, error) {
 	return &er, nil
 }
 
-//BuildTaskStruct build task struct
-type BuildTaskStruct struct {
-	TaskType string
-	TaskBody []byte
-	User     string
+//GetBegin get db transaction
+func GetBegin() *gorm.DB {
+	return db.GetManager().Begin()
 }
 
-//BuildTaskBuild build task
-func BuildTaskBuild(t *BuildTaskStruct) (*pb.EnqueueRequest, error) {
-	var er pb.EnqueueRequest
-	er.Topic = "builder"
-	er.Message = &pb.TaskMessage{
-		TaskType:   t.TaskType,
-		CreateTime: time.Now().Format(time.RFC3339),
-		TaskBody:   t.TaskBody,
-		User:       t.User,
+func dbInit() error {
+	logrus.Info("api database initialization starting...")
+	begin := GetBegin()
+	// Permissions set
+	var rac dbModel.RegionAPIClass
+	if err := begin.Where("class_level=? and prefix=?", "server_source", "/v2/show").Find(&rac).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			data := map[string]string{
+				"/v2/show":           "server_source",
+				"/v2/cluster":        "server_source",
+				"/v2/resources":      "server_source",
+				"/v2/builder":        "server_source",
+				"/v2/tenants":        "server_source",
+				"/v2/app":            "server_source",
+				"/v2/port":           "server_source",
+				"/v2/volume-options": "server_source",
+				"/api/v1":            "server_source",
+				"/v2/events":         "server_source",
+				"/v2/gateway/ips":    "server_source",
+				"/v2/gateway/ports":  "server_source",
+				"/v2/nodes":          "node_manager",
+				"/v2/job":            "node_manager",
+				"/v2/configs":        "node_manager",
+			}
+			tx := begin
+			var rollback bool
+			for k, v := range data {
+				if err := db.GetManager().RegionAPIClassDaoTransactions(tx).AddModel(&dbModel.RegionAPIClass{
+					ClassLevel: v,
+					Prefix:     k,
+				}); err != nil {
+					tx.Rollback()
+					rollback = true
+					break
+				}
+			}
+			if !rollback {
+				tx.Commit()
+			}
+		} else {
+			return err
+		}
 	}
-	return &er, nil
+
+	//Port Protocol support
+	var rps dbModel.RegionProcotols
+	if err := begin.Where("protocol_group=? and protocol_child=?", "http", "http").Find(&rps).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			data := map[string][]string{
+				"http":   []string{"http"},
+				"stream": []string{"mysql", "tcp", "udp"},
+			}
+			tx := begin
+			var rollback bool
+			for k, v := range data {
+				for _, v1 := range v {
+					if err := db.GetManager().RegionProcotolsDaoTransactions(tx).AddModel(&dbModel.RegionProcotols{
+						ProtocolGroup: k,
+						ProtocolChild: v1,
+						APIVersion:    "v2",
+						IsSupport:     true,
+					}); err != nil {
+						tx.Rollback()
+						rollback = true
+						break
+					}
+				}
+			}
+			if !rollback {
+				tx.Commit()
+			}
+		} else {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func dataInitialization() {
+	timer := time.NewTimer(time.Second * 2)
+	defer timer.Stop()
+	for {
+		err := dbInit()
+		if err != nil {
+			logrus.Error("Initializing database failed, ", err)
+		} else {
+			logrus.Info("api database initialization success!")
+			return
+		}
+		select {
+		case <-timer.C:
+			timer.Reset(time.Second * 2)
+		}
+	}
 }

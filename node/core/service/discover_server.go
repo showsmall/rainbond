@@ -23,32 +23,31 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	api_model "github.com/goodrain/rainbond/api/model"
 	"github.com/goodrain/rainbond/api/util"
 	"github.com/goodrain/rainbond/cmd/node/option"
 	envoyv1 "github.com/goodrain/rainbond/node/core/envoy/v1"
 	"github.com/goodrain/rainbond/node/core/store"
+	"github.com/goodrain/rainbond/node/kubecache"
 	"github.com/pquerna/ffjson/ffjson"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/informers"
 )
 
 //DiscoverAction DiscoverAction
 type DiscoverAction struct {
-	conf            *option.Conf
-	etcdCli         *store.Client
-	sharedInformers informers.SharedInformerFactory
+	conf    *option.Conf
+	etcdCli *store.Client
+	kubecli kubecache.KubeClient
 }
 
 //CreateDiscoverActionManager CreateDiscoverActionManager
-func CreateDiscoverActionManager(conf *option.Conf, sharedInformers informers.SharedInformerFactory) *DiscoverAction {
+func CreateDiscoverActionManager(conf *option.Conf, kubecli kubecache.KubeClient) *DiscoverAction {
 	return &DiscoverAction{
-		conf:            conf,
-		etcdCli:         store.DefalutClient,
-		sharedInformers: sharedInformers,
+		conf:    conf,
+		etcdCli: store.DefalutClient,
+		kubecli: kubecli,
 	}
 }
 
@@ -68,11 +67,11 @@ func (d *DiscoverAction) DiscoverService(serviceInfo string) (*envoyv1.SDSHost, 
 	if err != nil {
 		return nil, util.CreateAPIHandleError(500, err)
 	}
-	endpoints, err := d.sharedInformers.Core().V1().Endpoints().Lister().Endpoints(namespace).List(selector)
+	endpoints, err := d.kubecli.GetEndpoints(namespace, selector)
 	if err != nil {
 		return nil, util.CreateAPIHandleError(500, err)
 	}
-	services, err := d.sharedInformers.Core().V1().Services().Lister().Services(namespace).List(selector)
+	services, err := d.kubecli.GetServices(namespace, selector)
 	if err != nil {
 		return nil, util.CreateAPIHandleError(500, err)
 	}
@@ -83,15 +82,14 @@ func (d *DiscoverAction) DiscoverService(serviceInfo string) (*envoyv1.SDSHost, 
 			if err != nil {
 				return nil, util.CreateAPIHandleError(500, err)
 			}
-			endpoints, err = d.sharedInformers.Core().V1().Endpoints().Lister().Endpoints(namespace).List(selector)
+			endpoints, err = d.kubecli.GetEndpoints(namespace, selector)
 			if err != nil {
 				return nil, util.CreateAPIHandleError(500, err)
 			}
 			if len(endpoints) == 0 {
-				logrus.Debugf("outer endpoints items length is 0, continue")
 				return nil, util.CreateAPIHandleError(400, fmt.Errorf("outer have no endpoints"))
 			}
-			services, err = d.sharedInformers.Core().V1().Services().Lister().Services(namespace).List(selector)
+			services, err = d.kubecli.GetServices(namespace, selector)
 			if err != nil {
 				return nil, util.CreateAPIHandleError(500, err)
 			}
@@ -108,11 +106,6 @@ func (d *DiscoverAction) DiscoverService(serviceInfo string) (*envoyv1.SDSHost, 
 		if len(addressList) == 0 {
 			addressList = item.Subsets[0].NotReadyAddresses
 		}
-		// rainbond create service only one port,so do not verify the port
-		// port := item.Subsets[0].Ports[0].Port
-		// if dPort != fmt.Sprintf("%d", port) {
-		// 	continue
-		// }
 		toport := int(services[key].Spec.Ports[0].Port)
 		if serviceAlias == destServiceAlias {
 			if originPort, ok := services[key].Labels["origin_port"]; ok {
@@ -150,7 +143,7 @@ func (d *DiscoverAction) DiscoverClusters(
 	pluginID := nn[1]
 	serviceAlias := nn[2]
 	var cds = &envoyv1.CDSCluter{}
-	resources, err := d.ToolsGetRainbondResources(namespace, serviceAlias, pluginID)
+	resources, err := d.GetPluginConfigs(namespace, serviceAlias, pluginID)
 	if err != nil {
 		if strings.Contains(err.Error(), "is not exist") {
 			return cds, nil
@@ -158,6 +151,9 @@ func (d *DiscoverAction) DiscoverClusters(
 		logrus.Warnf("in lds get env %s error: %v", namespace+serviceAlias+pluginID, err)
 		return nil, util.CreateAPIHandleError(500, fmt.Errorf(
 			"get env %s error: %v", namespace+serviceAlias+pluginID, err))
+	}
+	if resources == nil {
+		return cds, nil
 	}
 	if resources.BaseServices != nil && len(resources.BaseServices) > 0 {
 		clusters, err := d.upstreamClusters(serviceAlias, namespace, resources.BaseServices)
@@ -188,7 +184,7 @@ func (d *DiscoverAction) upstreamClusters(serviceAlias, namespace string, depend
 		if err != nil {
 			return nil, util.CreateAPIHandleError(500, err)
 		}
-		services, err := d.sharedInformers.Core().V1().Services().Lister().Services(namespace).List(selector)
+		services, err := d.kubecli.GetServices(namespace, selector)
 		if err != nil {
 			return nil, util.CreateAPIHandleError(500, err)
 		}
@@ -266,7 +262,7 @@ func (d *DiscoverAction) DiscoverListeners(
 	pluginID := nn[1]
 	serviceAlias := nn[2]
 	lds := &envoyv1.LDSListener{}
-	resources, err := d.ToolsGetRainbondResources(namespace, serviceAlias, pluginID)
+	resources, defaultMesh, err := d.GetPluginConfigAndType(namespace, serviceAlias, pluginID)
 	if err != nil {
 		if strings.Contains(err.Error(), "is not exist") {
 			return lds, nil
@@ -275,8 +271,11 @@ func (d *DiscoverAction) DiscoverListeners(
 		return nil, util.CreateAPIHandleError(500, fmt.Errorf(
 			"get env %s error: %v", namespace+serviceAlias+pluginID, err))
 	}
+	if resources == nil {
+		return lds, nil
+	}
 	if resources.BaseServices != nil && len(resources.BaseServices) > 0 {
-		listeners, err := d.upstreamListener(serviceAlias, namespace, resources.BaseServices)
+		listeners, err := d.upstreamListener(serviceAlias, namespace, resources.BaseServices, !defaultMesh)
 		if err != nil {
 			return nil, err
 		}
@@ -295,24 +294,22 @@ func (d *DiscoverAction) DiscoverListeners(
 
 //upstreamListener handle upstream app listener
 // handle kubernetes inner service
-func (d *DiscoverAction) upstreamListener(serviceAlias, namespace string, dependsServices []*api_model.BaseService) (envoyv1.Listeners, *util.APIHandleError) {
+func (d *DiscoverAction) upstreamListener(serviceAlias, namespace string, dependsServices []*api_model.BaseService, createHTTPListen bool) (envoyv1.Listeners, *util.APIHandleError) {
 	var vhL []*envoyv1.VirtualHost
 	var ldsL envoyv1.Listeners
 	var portMap = make(map[int32]int, 0)
 	for i := range dependsServices {
 		destService := dependsServices[i]
 		destServiceAlias := destService.DependServiceAlias
-		start := time.Now()
 		labelname := fmt.Sprintf("name=%sService", destServiceAlias)
 		selector, err := labels.Parse(labelname)
 		if err != nil {
 			return nil, util.CreateAPIHandleError(500, err)
 		}
-		services, err := d.sharedInformers.Core().V1().Services().Lister().Services(namespace).List(selector)
+		services, err := d.kubecli.GetServices(namespace, selector)
 		if err != nil {
 			return nil, util.CreateAPIHandleError(500, err)
 		}
-		fmt.Printf("get %s service cost time %s \n", destService.DependServiceAlias, time.Now().Sub(start).String())
 		if len(services) == 0 {
 			logrus.Debugf("inner endpoints items length is 0, continue")
 			continue
@@ -365,7 +362,7 @@ func (d *DiscoverAction) upstreamListener(serviceAlias, namespace string, depend
 		}
 	}
 	// create common http listener
-	if len(vhL) != 0 {
+	if len(vhL) != 0 && createHTTPListen {
 		newVHL := envoyv1.UniqVirtualHost(vhL)
 		for i, lds := range ldsL {
 			if lds.Address == "tcp://127.0.0.1:80" {
@@ -408,42 +405,48 @@ func Duplicate(a interface{}) (ret []interface{}) {
 	return ret
 }
 
-//ToolsGetSourcesEnv rds
-//envName maybe is plugin id
-func (d *DiscoverAction) ToolsGetSourcesEnv(
-	namespace, sourceAlias, envName string) ([]byte, *util.APIHandleError) {
-	k := fmt.Sprintf("/resources/define/%s/%s/%s", namespace, sourceAlias, envName)
-	resp, err := d.etcdCli.Get(k)
-	if err != nil {
-		logrus.Errorf("get etcd value error, %v", err)
-		return nil, util.CreateAPIHandleError(500, err)
-	}
-	if resp.Count != 0 {
-		v := resp.Kvs[0].Value
-		return v, nil
-	}
-	return []byte{}, nil
-}
-
-//ToolsGetRainbondResources get plugin configs from etcd
+//GetPluginConfigs get plugin configs
 //if not exist return error
-func (d *DiscoverAction) ToolsGetRainbondResources(namespace, sourceAlias, pluginID string) (*api_model.ResourceSpec, error) {
-	k := fmt.Sprintf("/resources/define/%s/%s/%s", namespace, sourceAlias, pluginID)
-	resp, err := d.etcdCli.Get(k)
+func (d *DiscoverAction) GetPluginConfigs(namespace, sourceAlias, pluginID string) (*api_model.ResourceSpec, error) {
+	labelname := fmt.Sprintf("plugin_id=%s,service_alias=%s", pluginID, sourceAlias)
+	selector, err := labels.Parse(labelname)
 	if err != nil {
-		logrus.Errorf("get etcd value error, %v", err)
 		return nil, err
 	}
+	configs, err := d.kubecli.GetConfig(namespace, selector)
+	if err != nil {
+		return nil, fmt.Errorf("get plugin config failure %s", err.Error())
+	}
+	if len(configs) == 0 {
+		return nil, nil
+	}
 	var rs api_model.ResourceSpec
-	if resp.Count != 0 {
-		v := resp.Kvs[0].Value
-		if err := ffjson.Unmarshal(v, &rs); err != nil {
-			logrus.Errorf("unmashal etcd v error, %v", err)
-			return nil, err
-		}
-	} else {
-		logrus.Warningf("resources is not exist, key is %s", k)
-		return nil, fmt.Errorf("resources is not exist")
+	if err := ffjson.Unmarshal([]byte(configs[0].Data["plugin-config"]), &rs); err != nil {
+		logrus.Errorf("unmashal etcd v error, %v", err)
+		return nil, err
 	}
 	return &rs, nil
+}
+
+//GetPluginConfigAndType get plugin configs and plugin type (default mesh or custom mesh)
+//if not exist return error
+func (d *DiscoverAction) GetPluginConfigAndType(namespace, sourceAlias, pluginID string) (*api_model.ResourceSpec, bool, error) {
+	labelname := fmt.Sprintf("plugin_id=%s,service_alias=%s", pluginID, sourceAlias)
+	selector, err := labels.Parse(labelname)
+	if err != nil {
+		return nil, false, err
+	}
+	configs, err := d.kubecli.GetConfig(namespace, selector)
+	if err != nil {
+		return nil, false, fmt.Errorf("get plugin config failure %s", err.Error())
+	}
+	if len(configs) == 0 {
+		return nil, false, nil
+	}
+	var rs api_model.ResourceSpec
+	if err := ffjson.Unmarshal([]byte(configs[0].Data["plugin-config"]), &rs); err != nil {
+		logrus.Errorf("unmashal etcd v error, %v", err)
+		return nil, strings.Contains(configs[0].Name, "def-mesh"), err
+	}
+	return &rs, strings.Contains(configs[0].Name, "def-mesh"), nil
 }

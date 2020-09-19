@@ -21,13 +21,15 @@ package masterserver
 import (
 	"context"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/goodrain/rainbond/node/masterserver/task"
+	"github.com/goodrain/rainbond/node/masterserver/monitor"
 
-	"k8s.io/client-go/kubernetes"
+	"github.com/sirupsen/logrus"
 
-	"github.com/goodrain/rainbond/node/api/model"
+	"github.com/goodrain/rainbond/node/kubecache"
+	"github.com/goodrain/rainbond/node/nodem/client"
+
 	"github.com/goodrain/rainbond/node/core/config"
 	"github.com/goodrain/rainbond/node/core/store"
 	"github.com/goodrain/rainbond/node/masterserver/node"
@@ -36,28 +38,32 @@ import (
 //MasterServer 主节点服务
 type MasterServer struct {
 	*store.Client
-	*model.HostNode
+	*client.HostNode
 	Cluster          *node.Cluster
-	TaskEngine       *task.TaskEngine
 	ctx              context.Context
 	cancel           context.CancelFunc
 	datacenterConfig *config.DataCenterConfig
+	clusterMonitor   monitor.Manager
 }
 
 //NewMasterServer 创建master节点
-func NewMasterServer(modelnode *model.HostNode, k8sClient *kubernetes.Clientset) (*MasterServer, error) {
+func NewMasterServer(modelnode *client.HostNode, kubecli kubecache.KubeClient) (*MasterServer, error) {
 	datacenterConfig := config.GetDataCenterConfig()
 	ctx, cancel := context.WithCancel(context.Background())
-	nodecluster := node.CreateCluster(k8sClient, modelnode, datacenterConfig)
-	taskengin := task.CreateTaskEngine(nodecluster, modelnode)
+	nodecluster := node.CreateCluster(kubecli, modelnode, datacenterConfig)
+	clusterMonitor, err := monitor.CreateManager(nodecluster)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	ms := &MasterServer{
 		Client:           store.DefalutClient,
-		TaskEngine:       taskengin,
 		HostNode:         modelnode,
 		Cluster:          nodecluster,
 		ctx:              ctx,
 		cancel:           cancel,
 		datacenterConfig: datacenterConfig,
+		clusterMonitor:   clusterMonitor,
 	}
 	return ms, nil
 }
@@ -69,11 +75,7 @@ func (m *MasterServer) Start(errchan chan error) error {
 		logrus.Error("node cluster start error,", err.Error())
 		return err
 	}
-	if err := m.TaskEngine.Start(errchan); err != nil {
-		logrus.Error("task engin start error,", err.Error())
-		return err
-	}
-	return nil
+	return m.clusterMonitor.Start(errchan)
 }
 
 //Stop 停止
@@ -81,8 +83,13 @@ func (m *MasterServer) Stop(i interface{}) {
 	if m.Cluster != nil {
 		m.Cluster.Stop(i)
 	}
-	if m.TaskEngine != nil {
-		m.TaskEngine.Stop()
+	if m.clusterMonitor != nil {
+		m.clusterMonitor.Stop()
 	}
 	m.cancel()
+}
+
+//GetRegistry get monitor metric registry
+func (m *MasterServer) GetRegistry() *prometheus.Registry {
+	return m.clusterMonitor.GetRegistry()
 }

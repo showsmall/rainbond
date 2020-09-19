@@ -23,9 +23,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/goodrain/rainbond/builder"
+
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
-	"github.com/docker/engine-api/client"
+	"github.com/docker/docker/client"
 	"github.com/goodrain/rainbond/builder/sources"
 	"github.com/goodrain/rainbond/event"
 	"github.com/pquerna/ffjson/ffjson"
@@ -72,7 +74,7 @@ func SharePluginItemCreater(in []byte, m *exectorManager) (TaskWorker, error) {
 
 //Run Run
 func (i *PluginShareItem) Run(timeout time.Duration) error {
-	_, err := sources.ImagePull(i.DockerClient, i.LocalImageName, "", "", i.Logger, 10)
+	_, err := sources.ImagePull(i.DockerClient, i.LocalImageName, builder.REGISTRYUSER, builder.REGISTRYPASS, i.Logger, 10)
 	if err != nil {
 		logrus.Errorf("pull image %s error: %s", i.LocalImageName, err.Error())
 		i.Logger.Error(fmt.Sprintf("拉取应用镜像: %s失败", i.LocalImageName), map[string]string{"step": "builder-exector", "status": "failure"})
@@ -83,10 +85,11 @@ func (i *PluginShareItem) Run(timeout time.Duration) error {
 		i.Logger.Error(fmt.Sprintf("修改镜像tag: %s -> %s 失败", i.LocalImageName, i.ImageName), map[string]string{"step": "builder-exector", "status": "failure"})
 		return err
 	}
+	user, pass := builder.GetImageUserInfo(i.ImageInfo.HubUser, i.ImageInfo.HubPassword)
 	if i.ImageInfo.IsTrust {
-		err = sources.TrustedImagePush(i.DockerClient, i.ImageName, i.ImageInfo.HubUser, i.ImageInfo.HubPassword, i.Logger, 10)
+		err = sources.TrustedImagePush(i.DockerClient, i.ImageName, user, pass, i.Logger, 10)
 	} else {
-		err = sources.ImagePush(i.DockerClient, i.ImageName, i.ImageInfo.HubUser, i.ImageInfo.HubPassword, i.Logger, 10)
+		err = sources.ImagePush(i.DockerClient, i.ImageName, user, pass, i.Logger, 10)
 	}
 	if err != nil {
 		if err.Error() == "authentication required" {
@@ -100,7 +103,7 @@ func (i *PluginShareItem) Run(timeout time.Duration) error {
 	return i.updateShareStatus("success")
 }
 
-//Stop stop
+//Stop
 func (i *PluginShareItem) Stop() error {
 	return nil
 }

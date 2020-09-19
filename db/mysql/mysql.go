@@ -23,10 +23,11 @@ import (
 
 	"github.com/goodrain/rainbond/db/config"
 	"github.com/goodrain/rainbond/db/model"
-
-	"github.com/Sirupsen/logrus"
 	"github.com/jinzhu/gorm"
-	_ "github.com/jinzhu/gorm/dialects/mysql"
+	"github.com/sirupsen/logrus"
+
+	// import sql driver manually
+	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
 )
 
@@ -78,9 +79,19 @@ func (m *Manager) Begin() *gorm.DB {
 	return m.db.Begin()
 }
 
+// EnsureEndTransactionFunc -
+func (m *Manager) EnsureEndTransactionFunc() func(tx *gorm.DB) {
+	return func(tx *gorm.DB) {
+		if r := recover(); r != nil {
+			logrus.Errorf("Unexpected panic occurred, rollback transaction: %v", r)
+			tx.Rollback()
+		}
+	}
+}
+
 //Print Print
 func (m *Manager) Print(v ...interface{}) {
-	logrus.Info(v)
+	logrus.Info(v...)
 }
 
 //RegisterTableModel register table model
@@ -93,21 +104,16 @@ func (m *Manager) RegisterTableModel() {
 	m.models = append(m.models, &model.TenantServiceMountRelation{})
 	m.models = append(m.models, &model.TenantServiceVolume{})
 	m.models = append(m.models, &model.TenantServiceLable{})
-	m.models = append(m.models, &model.K8sService{})
-	m.models = append(m.models, &model.K8sDeployReplication{})
-	m.models = append(m.models, &model.K8sPod{})
-	m.models = append(m.models, &model.ServiceProbe{})
-	m.models = append(m.models, &model.TenantServiceStatus{})
+	m.models = append(m.models, &model.TenantServiceProbe{})
 	m.models = append(m.models, &model.LicenseInfo{})
 	m.models = append(m.models, &model.TenantServicesDelete{})
-	//vs map port
 	m.models = append(m.models, &model.TenantServiceLBMappingPort{})
 	m.models = append(m.models, &model.TenantPlugin{})
 	m.models = append(m.models, &model.TenantPluginBuildVersion{})
 	m.models = append(m.models, &model.TenantServicePluginRelation{})
 	m.models = append(m.models, &model.TenantPluginVersionEnv{})
+	m.models = append(m.models, &model.TenantPluginVersionDiscoverConfig{})
 	m.models = append(m.models, &model.CodeCheckResult{})
-	m.models = append(m.models, &model.AppPublish{})
 	m.models = append(m.models, &model.ServiceEvent{})
 	m.models = append(m.models, &model.VersionInfo{})
 	m.models = append(m.models, &model.RegionUserInfo{})
@@ -118,6 +124,24 @@ func (m *Manager) RegisterTableModel() {
 	m.models = append(m.models, &model.NotificationEvent{})
 	m.models = append(m.models, &model.AppStatus{})
 	m.models = append(m.models, &model.AppBackup{})
+	m.models = append(m.models, &model.ServiceSourceConfig{})
+	// gateway
+	m.models = append(m.models, &model.Certificate{})
+	m.models = append(m.models, &model.RuleExtension{})
+	m.models = append(m.models, &model.HTTPRule{})
+	m.models = append(m.models, &model.TCPRule{})
+	m.models = append(m.models, &model.TenantServiceConfigFile{})
+	m.models = append(m.models, &model.Endpoint{})
+	m.models = append(m.models, &model.ThirdPartySvcDiscoveryCfg{})
+	m.models = append(m.models, &model.GwRuleConfig{})
+
+	// volumeType
+	m.models = append(m.models, &model.TenantServiceVolumeType{})
+	// pod autoscaler
+	m.models = append(m.models, &model.TenantServiceAutoscalerRules{})
+	m.models = append(m.models, &model.TenantServiceAutoscalerRuleMetrics{})
+	m.models = append(m.models, &model.TenantServiceScalingRecords{})
+	m.models = append(m.models, &model.TenantServiceMonitor{})
 }
 
 //CheckTable check and create tables
@@ -151,77 +175,19 @@ func (m *Manager) CheckTable() {
 }
 
 func (m *Manager) patchTable() {
-	// Permissions set
-	var rac model.RegionAPIClass
-	if err := m.db.Where("class_level=? and prefix=?", "server_source", "/v2/show").Find(&rac).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			data := map[string]string{
-				"/v2/show":       "server_source",
-				"/v2/opentsdb":   "server_source",
-				"/v2/resources":  "server_source",
-				"/v2/builder":    "server_source",
-				"/v2/tenants":    "server_source",
-				"/v2/app":        "server_source",
-				"/api/v1":        "server_source",
-				"/v2/nodes":      "node_manager",
-				"/v2/job":        "node_manager",
-				"/v2/tasks":      "node_manager",
-				"/v2/taskgroups": "node_manager",
-				"/v2/tasktemps":  "node_manager",
-				"/v2/configs":    "node_manager",
-			}
-			tx := m.Begin()
-			var rollback bool
-			for k, v := range data {
-				if err := m.RegionAPIClassDaoTransactions(tx).AddModel(&model.RegionAPIClass{
-					ClassLevel: v,
-					Prefix:     k,
-				}); err != nil {
-					tx.Rollback()
-					rollback = true
-					break
-				}
-			}
-			if !rollback {
-				tx.Commit()
-			}
-		}
+	//modify tenant service env max size to 1024
+	if err := m.db.Exec("alter table tenant_services_envs modify column attr_value varchar(1024);").Error; err != nil {
+		logrus.Errorf("alter table tenant_services_envs error %s", err.Error())
 	}
 
-	//Port Protocol support
-	var rps model.RegionProcotols
-	if err := m.db.Where("protocol_group=? and protocol_child=?", "http", "http").Find(&rps).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			data := map[string][]string{
-				"http":   []string{"http"},
-				"stream": []string{"mysql", "tcp", "udp"},
-			}
-			tx := m.Begin()
-			var rollback bool
-			for k, v := range data {
-				for _, v1 := range v {
-					if err := m.RegionProcotolsDaoTransactions(tx).AddModel(&model.RegionProcotols{
-						ProtocolGroup: k,
-						ProtocolChild: v1,
-						APIVersion:    "v2",
-						IsSupport:     true,
-					}); err != nil {
-						tx.Rollback()
-						rollback = true
-						break
-					}
-				}
-			}
-			if !rollback {
-				tx.Commit()
-			}
-		}
+	if err := m.db.Exec("alter table tenant_services_event modify column request_body varchar(1024);").Error; err != nil {
+		logrus.Errorf("alter table tenant_services_envent error %s", err.Error())
 	}
-	//set plugin version image name length
-	if err := m.db.Exec("alter table tenant_plugin_build_version modify column base_image varchar(200);").Error; err != nil {
-		logrus.Errorf("alter table tenant_plugin_build_version error %s", err.Error())
+
+	if err := m.db.Exec("update gateway_tcp_rule set ip=? where ip=?", "0.0.0.0", "").Error; err != nil {
+		logrus.Errorf("update gateway_tcp_rule data error %s", err.Error())
 	}
-	if err := m.db.Exec("alter table tenant_plugin_build_version modify column build_local_image varchar(200);").Error; err != nil {
-		logrus.Errorf("alter table tenant_plugin_build_version error %s", err.Error())
+	if err := m.db.Exec("alter table tenant_services_volume modify column volume_type varchar(64);").Error; err != nil {
+		logrus.Errorf("alter table tenant_services_volume error: %s", err.Error())
 	}
 }

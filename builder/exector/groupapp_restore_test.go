@@ -19,36 +19,15 @@
 package exector
 
 import (
-	"fmt"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/pquerna/ffjson/ffjson"
 
 	dbmodel "github.com/goodrain/rainbond/db/model"
 	"github.com/goodrain/rainbond/event"
-
 	"github.com/goodrain/rainbond/util"
 )
-
-func TestDownloadFromLocal(t *testing.T) {
-	var b = BackupAPPRestore{
-		BackupID: "test",
-		EventID:  "test",
-		Logger:   event.GetTestLogger(),
-	}
-	cacheDir := fmt.Sprintf("/tmp/%s/%s", b.BackupID, b.EventID)
-	if err := util.CheckAndCreateDir(cacheDir); err != nil {
-		t.Fatal("create cache dir error", err.Error())
-	}
-	b.cacheDir = cacheDir
-	if err := b.downloadFromFTP(&dbmodel.AppBackup{
-		EventID:  "test",
-		BackupID: "ccc",
-	}); err != nil {
-		t.Fatal("downloadFromLocal error", err.Error())
-	}
-	t.Log(b.cacheDir)
-}
 
 func TestModify(t *testing.T) {
 	var b = BackupAPPRestore{
@@ -87,7 +66,18 @@ func TestModify(t *testing.T) {
 			},
 		},
 	}
-	b.modify(appSnapshots)
-	re, _ := ffjson.Marshal(appSnapshots)
+	appSnapshot := AppSnapshot{
+		Services: appSnapshots,
+	}
+	b.modify(&appSnapshot)
+	re, _ := ffjson.Marshal(appSnapshot)
 	t.Log(string(re))
+}
+
+func TestUnzipAllDataFile(t *testing.T) {
+	allDataFilePath := "/tmp/__all_data.zip"
+	allTmpDir := "/tmp/4f25c53e864744ec95d037528acaa708"
+	if err := util.Unzip(allDataFilePath, allTmpDir); err != nil {
+		logrus.Errorf("unzip all data file failure %s", err.Error())
+	}
 }

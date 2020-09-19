@@ -21,6 +21,8 @@ package dao
 import (
 	"fmt"
 
+	"github.com/sirupsen/logrus"
+	"github.com/goodrain/rainbond/db/errors"
 	"github.com/goodrain/rainbond/db/model"
 	"github.com/jinzhu/gorm"
 )
@@ -39,7 +41,8 @@ func (t *PluginDaoImpl) AddModel(mo model.Interface) error {
 			return err
 		}
 	} else {
-		return fmt.Errorf("plugin %s in tenant %s is exist", plugin.PluginName, plugin.TenantID)
+		logrus.Infof("plugin id: %s; tenant id: %s; tenant plugin already exist", plugin.PluginID, plugin.TenantID)
+		return errors.ErrRecordAlreadyExist
 	}
 	return nil
 }
@@ -62,6 +65,18 @@ func (t *PluginDaoImpl) GetPluginByID(id, tenantID string) (*model.TenantPlugin,
 	return &plugin, nil
 }
 
+// ListByIDs returns the list of plugins based on the given plugin ids.
+func (t *PluginDaoImpl) ListByIDs(ids []string) ([]*model.TenantPlugin, error) {
+	var plugins []*model.TenantPlugin
+	if err := t.DB.Where("plugin_id in (?)", ids).Find(&plugins).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return plugins, nil
+}
+
 //DeletePluginByID DeletePluginByID
 func (t *PluginDaoImpl) DeletePluginByID(id, tenantID string) error {
 	var plugin model.TenantPlugin
@@ -77,6 +92,16 @@ func (t *PluginDaoImpl) GetPluginsByTenantID(tenantID string) ([]*model.TenantPl
 	if err := t.DB.Where("tenant_id=?", tenantID).Find(&plugins).Error; err != nil {
 		return nil, err
 	}
+	return plugins, nil
+}
+
+// ListByTenantID -
+func (t *PluginDaoImpl) ListByTenantID(tenantID string) ([]*model.TenantPlugin, error) {
+	var plugins []*model.TenantPlugin
+	if err := t.DB.Where("tenant_id=?", tenantID).Find(&plugins).Error; err != nil {
+		return nil, err
+	}
+
 	return plugins, nil
 }
 
@@ -198,7 +223,8 @@ func (t *PluginBuildVersionDaoImpl) AddModel(mo model.Interface) error {
 			return err
 		}
 	} else {
-		return fmt.Errorf("plugin build version %s and deploy_verson %s is exist", version.VersionID, version.DeployVersion)
+		logrus.Infof("plugin id: %s; version_id: %s; deploy_version: %s; tenant plugin build versoin already exist", version.PluginID, version.VersionID, version.DeployVersion)
+		return errors.ErrRecordAlreadyExist
 	}
 	return nil
 }
@@ -263,6 +289,15 @@ func (t *PluginBuildVersionDaoImpl) GetBuildVersionByDeployVersion(pluginID, ver
 		return nil, err
 	}
 	return &version, nil
+}
+
+// ListSuccessfulOnesByPluginIDs returns the list of successful build versions,
+func (t *PluginBuildVersionDaoImpl) ListSuccessfulOnesByPluginIDs(pluginIDs []string) ([]*model.TenantPluginBuildVersion, error) {
+	var version []*model.TenantPluginBuildVersion
+	if err := t.DB.Where("ID in (?) ", t.DB.Table("tenant_plugin_build_version").Select("max(id)").Where("plugin_id in (?) and status=?", pluginIDs, "complete").Group("plugin_id").QueryExpr()).Find(&version).Error; err != nil {
+		return nil, err
+	}
+	return version, nil
 }
 
 //GetLastBuildVersionByVersionID get last success build version
@@ -350,6 +385,87 @@ func (t *PluginVersionEnvDaoImpl) GetVersionEnvByEnvName(serviceID, pluginID, en
 	return &env, nil
 }
 
+// ListByServiceID returns the list of environment variables for the plugin via serviceID
+func (t *PluginVersionEnvDaoImpl) ListByServiceID(serviceID string) ([]*model.TenantPluginVersionEnv, error) {
+	var envs []*model.TenantPluginVersionEnv
+	if err := t.DB.Where("service_id=?", serviceID).Find(&envs).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return envs, nil
+}
+
+//PluginVersionConfigDaoImpl PluginVersionEnvDaoImpl
+type PluginVersionConfigDaoImpl struct {
+	DB *gorm.DB
+}
+
+//AddModel add or update service plugin config
+func (t *PluginVersionConfigDaoImpl) AddModel(mo model.Interface) error {
+	config := mo.(*model.TenantPluginVersionDiscoverConfig)
+	var oldconfig model.TenantPluginVersionDiscoverConfig
+	if ok := t.DB.Where("service_id=? and plugin_id=?", config.ServiceID, config.PluginID).Find(&oldconfig).RecordNotFound(); ok {
+		if err := t.DB.Create(config).Error; err != nil {
+			return err
+		}
+	} else {
+		config.ID = oldconfig.ID
+		config.CreatedAt = oldconfig.CreatedAt
+		return t.UpdateModel(config)
+	}
+	return nil
+}
+
+//UpdateModel update service plugin config
+func (t *PluginVersionConfigDaoImpl) UpdateModel(mo model.Interface) error {
+	env := mo.(*model.TenantPluginVersionDiscoverConfig)
+	if env.ID == 0 || env.ServiceID == "" || env.PluginID == "" {
+		return fmt.Errorf("id can not be empty when update plugin version config")
+	}
+	if err := t.DB.Save(env).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+//DeletePluginConfig delete service plugin config
+func (t *PluginVersionConfigDaoImpl) DeletePluginConfig(serviceID, pluginID string) error {
+	var oldconfig model.TenantPluginVersionDiscoverConfig
+	if err := t.DB.Where("service_id=? and plugin_id=?", serviceID, pluginID).Delete(&oldconfig).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+//DeletePluginConfigByServiceID Batch delete config by service id
+func (t *PluginVersionConfigDaoImpl) DeletePluginConfigByServiceID(serviceID string) error {
+	var oldconfig model.TenantPluginVersionDiscoverConfig
+	if err := t.DB.Where("service_id=?", serviceID).Delete(&oldconfig).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+//GetPluginConfig get service plugin config
+func (t *PluginVersionConfigDaoImpl) GetPluginConfig(serviceID, pluginID string) (*model.TenantPluginVersionDiscoverConfig, error) {
+	var oldconfig model.TenantPluginVersionDiscoverConfig
+	if err := t.DB.Where("service_id=? and plugin_id=?", serviceID, pluginID).Find(&oldconfig).Error; err != nil {
+		return nil, err
+	}
+	return &oldconfig, nil
+}
+
+//GetPluginConfigs get plugin configs
+func (t *PluginVersionConfigDaoImpl) GetPluginConfigs(serviceID string) ([]*model.TenantPluginVersionDiscoverConfig, error) {
+	var oldconfigs []*model.TenantPluginVersionDiscoverConfig
+	if err := t.DB.Where("service_id=?", serviceID).Find(&oldconfigs).Error; err != nil {
+		return nil, err
+	}
+	return oldconfigs, nil
+}
+
 //TenantServicePluginRelationDaoImpl TenantServicePluginRelationDaoImpl
 type TenantServicePluginRelationDaoImpl struct {
 	DB *gorm.DB
@@ -364,7 +480,7 @@ func (t *TenantServicePluginRelationDaoImpl) AddModel(mo model.Interface) error 
 			return err
 		}
 	} else {
-		return fmt.Errorf("relation between %s and %s is exist", relation.ServiceID, relation.PluginID)
+		return errors.ErrRecordAlreadyExist
 	}
 	return nil
 }
@@ -490,10 +606,9 @@ func (t *TenantServicesStreamPluginPortDaoImpl) UpdateModel(mo model.Interface) 
 
 //GetPluginMappingPorts GetPluginMappingPorts  降序排列
 func (t *TenantServicesStreamPluginPortDaoImpl) GetPluginMappingPorts(
-	serviceID string, pluginModel string) ([]*model.TenantServicesStreamPluginPort, error) {
+	serviceID string) ([]*model.TenantServicesStreamPluginPort, error) {
 	var ports []*model.TenantServicesStreamPluginPort
-	if err := t.DB.Where("service_id=? and plugin_model=?",
-		serviceID, pluginModel).Order("plugin_port asc").Find(&ports).Error; err != nil {
+	if err := t.DB.Where("service_id=?", serviceID).Order("plugin_port asc").Find(&ports).Error; err != nil {
 		return nil, err
 	}
 	return ports, nil
@@ -523,7 +638,7 @@ func (t *TenantServicesStreamPluginPortDaoImpl) SetPluginMappingPort(
 	serviceID string,
 	pluginModel string,
 	containerPort int) (int, error) {
-	ports, err := t.GetPluginMappingPorts(serviceID, pluginModel)
+	ports, err := t.GetPluginMappingPorts(serviceID)
 	if err != nil {
 		return 0, err
 	}
@@ -602,4 +717,16 @@ func (t *TenantServicesStreamPluginPortDaoImpl) DeleteAllPluginMappingPortByServ
 		ServiceID: serviceID,
 	}
 	return t.DB.Where("service_id=?", serviceID).Delete(relation).Error
+}
+
+// ListByServiceID returns the list of environment variables for the plugin via serviceID
+func (t *TenantServicesStreamPluginPortDaoImpl) ListByServiceID(sid string) ([]*model.TenantServicesStreamPluginPort, error) {
+	var result []*model.TenantServicesStreamPluginPort
+	if err := t.DB.Where("service_id=?", sid).Find(&result).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return result, nil
 }

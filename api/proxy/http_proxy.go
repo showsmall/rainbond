@@ -19,9 +19,16 @@
 package proxy
 
 import (
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 //HTTPProxy HTTPProxy
@@ -29,23 +36,36 @@ type HTTPProxy struct {
 	name      string
 	endpoints EndpointList
 	lb        LoadBalance
+	client    *http.Client
 }
 
-//Proxy 代理
+//Proxy http proxy
 func (h *HTTPProxy) Proxy(w http.ResponseWriter, r *http.Request) {
 	endpoint := h.lb.Select(r, h.endpoints)
-	director := func(req *http.Request) {
-		req = r
-		req.URL.Scheme = "http"
-		req.URL.Host = endpoint.String()
+	endURL, err := url.Parse(endpoint.GetHTTPAddr())
+	if err != nil {
+		logrus.Errorf("parse endpoint url error,%s", err.Error())
+		w.WriteHeader(502)
+		return
 	}
-	proxy := &httputil.ReverseProxy{Director: director}
+	if endURL.Scheme == "" {
+		endURL.Scheme = "http"
+	}
+	proxy := httputil.NewSingleHostReverseProxy(endURL)
 	proxy.ServeHTTP(w, r)
 }
 
 //UpdateEndpoints 更新端点
 func (h *HTTPProxy) UpdateEndpoints(endpoints ...string) {
-	h.endpoints = CreateEndpoints(endpoints)
+	ends := []string{}
+	for _, end := range endpoints {
+		if kv := strings.Split(end, "=>"); len(kv) > 1 {
+			ends = append(ends, kv[1])
+		} else {
+			ends = append(ends, end)
+		}
+	}
+	h.endpoints = CreateEndpoints(ends)
 }
 
 //Do do proxy
@@ -56,9 +76,36 @@ func (h *HTTPProxy) Do(r *http.Request) (*http.Response, error) {
 	} else {
 		r.URL.Host = endpoint.String()
 	}
-	return http.DefaultClient.Do(r)
+	//default is http
+	r.URL.Scheme = "http"
+	return h.client.Do(r)
 }
 
-func createHTTPProxy(name string, endpoints []string) *HTTPProxy {
-	return &HTTPProxy{name, CreateEndpoints(endpoints), NewRoundRobin()}
+func createHTTPProxy(name string, endpoints []string, lb LoadBalance) *HTTPProxy {
+	ends := []string{}
+	for _, end := range endpoints {
+		if kv := strings.Split(end, "=>"); len(kv) > 1 {
+			ends = append(ends, kv[1])
+		} else {
+			ends = append(ends, end)
+		}
+	}
+	if lb == nil {
+		lb = NewRoundRobin()
+	}
+	timeout, _ := strconv.Atoi(os.Getenv("PROXY_TIMEOUT"))
+	if timeout == 0 {
+		timeout = 10
+	}
+	var netTransport = &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout: 5 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+	client := &http.Client{
+		Transport: netTransport,
+		Timeout:   time.Second * time.Duration(timeout),
+	}
+	return &HTTPProxy{name, CreateEndpoints(ends), lb, client}
 }

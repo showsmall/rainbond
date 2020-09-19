@@ -26,7 +26,7 @@ import (
 
 	"github.com/jinzhu/gorm"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/bitly/go-simplejson"
 	"github.com/go-chi/chi"
 	"github.com/goodrain/rainbond/db"
@@ -34,7 +34,7 @@ import (
 )
 
 //Event GetLogs
-func (e *TenantStruct) Event(w http.ResponseWriter, r *http.Request) {
+func (t *TenantStruct) Event(w http.ResponseWriter, r *http.Request) {
 	// swagger:operation GET  /v2/tenants/{tenant_name}/event v2 getevents
 	//
 	// 获取指定event_ids详细信息
@@ -103,8 +103,37 @@ func GetNotificationEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := db.GetManager().NotificationEventDao().GetNotificationEventByTime(startTime, endTime)
 	if err != nil {
+		logrus.Errorf(err.Error())
 		httputil.ReturnError(r, w, 500, err.Error())
 		return
+	}
+	for _, v := range res {
+		service, err := db.GetManager().TenantServiceDao().GetServiceByID(v.KindID)
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				v.ServiceName = ""
+				v.TenantName = ""
+				continue
+			} else {
+				logrus.Errorf(err.Error())
+				httputil.ReturnError(r, w, 500, err.Error())
+				return
+			}
+		}
+		tenant, err := db.GetManager().TenantDao().GetTenantByUUID(service.TenantID)
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				v.ServiceName = ""
+				v.TenantName = ""
+				continue
+			} else {
+				logrus.Errorf(err.Error())
+				httputil.ReturnError(r, w, 500, err.Error())
+				return
+			}
+		}
+		v.ServiceName = service.ServiceAlias
+		v.TenantName = tenant.Name
 	}
 	httputil.ReturnSuccess(r, w, res)
 }
@@ -115,7 +144,7 @@ type Handle struct {
 	Body struct {
 		//in: body
 		//handle message
-		HandleMessage string `json:"handle_message" validate:"handle_message|required"`
+		HandleMessage string `json:"handle_message" validate:"handle_message"`
 	}
 }
 
@@ -137,9 +166,9 @@ type Handle struct {
 //       "$ref": "#/responses/commandResponse"
 //     description: 统一返回格式
 func HandleNotificationEvent(w http.ResponseWriter, r *http.Request) {
-	hash := chi.URLParam(r, "hash")
-	if hash == "" {
-		httputil.ReturnError(r, w, 400, "hash id do not empty")
+	serviceAlias := chi.URLParam(r, "serviceAlias")
+	if serviceAlias == "" {
+		httputil.ReturnError(r, w, 400, "ServiceAlias id do not empty")
 		return
 	}
 	var handle Handle
@@ -147,7 +176,7 @@ func HandleNotificationEvent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	event, err := db.GetManager().NotificationEventDao().GetNotificationEventByHash(hash)
+	service, err := db.GetManager().TenantServiceDao().GetServiceByServiceAlias(serviceAlias)
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			httputil.ReturnError(r, w, 404, "not found")
@@ -156,18 +185,26 @@ func HandleNotificationEvent(w http.ResponseWriter, r *http.Request) {
 		httputil.ReturnError(r, w, 500, err.Error())
 		return
 	}
-	event.IsHandle = true
-	event.HandleMessage = handle.Body.HandleMessage
-	err = db.GetManager().NotificationEventDao().UpdateModel(event)
+	eventList, err := db.GetManager().NotificationEventDao().GetNotificationEventByKind("service", service.ServiceID)
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			httputil.ReturnError(r, w, 404, "not found")
-			return
-		}
 		httputil.ReturnError(r, w, 500, err.Error())
 		return
 	}
-	httputil.ReturnSuccess(r, w, event)
+	for _, event := range eventList {
+		event.IsHandle = true
+		event.HandleMessage = handle.Body.HandleMessage
+		err = db.GetManager().NotificationEventDao().UpdateModel(event)
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				httputil.ReturnError(r, w, 404, "not found")
+				return
+			}
+			httputil.ReturnError(r, w, 500, err.Error())
+			return
+		}
+	}
+
+	httputil.ReturnSuccess(r, w, nil)
 }
 
 //GetNotificationEvent GetNotificationEvent

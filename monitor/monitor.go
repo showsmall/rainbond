@@ -20,7 +20,9 @@ package monitor
 
 import (
 	"context"
-	"github.com/Sirupsen/logrus"
+	"time"
+
+	"github.com/sirupsen/logrus"
 	v3 "github.com/coreos/etcd/clientv3"
 	"github.com/goodrain/rainbond/cmd/monitor/option"
 	discoverv1 "github.com/goodrain/rainbond/discover"
@@ -28,11 +30,12 @@ import (
 	"github.com/goodrain/rainbond/discover/config"
 	"github.com/goodrain/rainbond/monitor/callback"
 	"github.com/goodrain/rainbond/monitor/prometheus"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
 	"github.com/goodrain/rainbond/util/watch"
 	"github.com/tidwall/gjson"
-	"time"
 )
 
+//Monitor monitor
 type Monitor struct {
 	config     *option.Config
 	ctx        context.Context
@@ -44,17 +47,44 @@ type Monitor struct {
 	discoverv2 discoverv2.Discover
 }
 
+//Start start
 func (d *Monitor) Start() {
 	d.discoverv1.AddProject("prometheus", &callback.Prometheus{Prometheus: d.manager})
 	d.discoverv1.AddProject("event_log_event_http", &callback.EventLog{Prometheus: d.manager})
-	d.discoverv1.AddProject("acp_entrance", &callback.Entrance{Prometheus: d.manager})
-	d.discoverv2.AddProject("app_sync_runtime_server", &callback.AppStatus{Prometheus: d.manager})
+	d.discoverv1.AddProject("acp_webcli", &callback.Webcli{Prometheus: d.manager})
+	d.discoverv1.AddProject("gateway", &callback.GatewayNode{Prometheus: d.manager})
+	d.discoverv2.AddProject("builder", &callback.Builder{Prometheus: d.manager})
+	d.discoverv2.AddProject("mq", &callback.Mq{Prometheus: d.manager})
+	d.discoverv2.AddProject("app_sync_runtime_server", &callback.Worker{Prometheus: d.manager})
 
 	// node and app runtime metrics needs to be monitored separately
 	go d.discoverNodes(&callback.Node{Prometheus: d.manager}, &callback.App{Prometheus: d.manager}, d.ctx.Done())
 
 	// monitor etcd members
-	go d.discoverEtcd(&callback.Etcd{Prometheus: d.manager}, d.ctx.Done())
+	go d.discoverEtcd(&callback.Etcd{
+		Prometheus: d.manager,
+		Scheme: func() string {
+			if d.config.EtcdCertFile != "" {
+				return "https"
+			}
+			return "http"
+		}(),
+		TLSConfig: prometheus.TLSConfig{
+			CAFile:   d.config.EtcdCaFile,
+			CertFile: d.config.EtcdCertFile,
+			KeyFile:  d.config.EtcdKeyFile,
+		},
+	}, d.ctx.Done())
+
+	// monitor Cadvisor
+	go d.discoverCadvisor(&callback.Cadvisor{
+		Prometheus: d.manager,
+		ListenPort: d.config.CadvisorListenPort,
+	}, d.ctx.Done())
+
+	// kubernetes service discovery
+	rbdapi := callback.RbdAPI{Prometheus: d.manager}
+	rbdapi.UpdateEndpoints(nil)
 }
 
 func (d *Monitor) discoverNodes(node *callback.Node, app *callback.App, done <-chan struct{}) {
@@ -93,9 +123,54 @@ func (d *Monitor) discoverNodes(node *callback.Node, app *callback.App, done <-c
 			case watch.Deleted:
 				node.Delete(&event)
 
-				isSlave := gjson.Get(event.GetValueString(), "labels.rainbond_node_rule_compute").String()
+				isSlave := gjson.Get(event.GetPreValueString(), "labels.rainbond_node_rule_compute").String()
 				if isSlave == "true" {
 					app.Delete(&event)
+				}
+			case watch.Error:
+				logrus.Error("error when read a event from result chan for discover all nodes: ", event.Error)
+			}
+		case <-done:
+			logrus.Info("stop discover nodes because received stop signal.")
+			return
+		}
+
+	}
+
+}
+
+func (d *Monitor) discoverCadvisor(c *callback.Cadvisor, done <-chan struct{}) {
+	// start listen node modified
+	watcher := watch.New(d.client, "")
+	w, err := watcher.WatchList(d.ctx, "/rainbond/nodes", "")
+	if err != nil {
+		logrus.Error("failed to watch list for discover all nodes: ", err)
+		return
+	}
+	defer w.Stop()
+
+	for {
+		select {
+		case event, ok := <-w.ResultChan():
+			if !ok {
+				logrus.Warn("the events channel is closed.")
+				return
+			}
+			switch event.Type {
+			case watch.Added:
+				isSlave := gjson.Get(event.GetValueString(), "labels.rainbond_node_rule_compute").String()
+				if isSlave == "true" {
+					c.Add(&event)
+				}
+			case watch.Modified:
+				isSlave := gjson.Get(event.GetValueString(), "labels.rainbond_node_rule_compute").String()
+				if isSlave == "true" {
+					c.Modify(&event)
+				}
+			case watch.Deleted:
+				isSlave := gjson.Get(event.GetPreValueString(), "labels.rainbond_node_rule_compute").String()
+				if isSlave == "true" {
+					c.Delete(&event)
 				}
 			case watch.Error:
 				logrus.Error("error when read a event from result chan for discover all nodes: ", event.Error)
@@ -125,18 +200,21 @@ func (d *Monitor) discoverEtcd(e *callback.Etcd, done <-chan struct{}) {
 
 			endpoints := make([]*config.Endpoint, 0, 5)
 			for _, member := range resp.Members {
-				url := member.GetName() + ":2379"
-				end := &config.Endpoint{
-					URL: url,
+				if len(member.ClientURLs) >= 1 {
+					url := member.ClientURLs[0]
+					end := &config.Endpoint{
+						URL: url,
+					}
+					endpoints = append(endpoints, end)
 				}
-				endpoints = append(endpoints, end)
 			}
-
+			logrus.Debugf("etcd endpoints: %+v", endpoints)
 			e.UpdateEndpoints(endpoints...)
 		}
 	}
 }
 
+// Stop stop monitor
 func (d *Monitor) Stop() {
 	logrus.Info("Stopping all child process for monitor")
 	d.cancel()
@@ -145,28 +223,31 @@ func (d *Monitor) Stop() {
 	d.client.Close()
 }
 
+// NewMonitor new monitor
 func NewMonitor(opt *option.Config, p *prometheus.Manager) *Monitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	defaultTimeout := time.Second * 3
 
-	cli, err := v3.New(v3.Config{
+	etcdClientArgs := &etcdutil.ClientArgs{
 		Endpoints:   opt.EtcdEndpoints,
 		DialTimeout: defaultTimeout,
-	})
+		CaFile:      opt.EtcdCaFile,
+		CertFile:    opt.EtcdCertFile,
+		KeyFile:     opt.EtcdKeyFile,
+	}
+
+	cli, err := etcdutil.NewClient(ctx, etcdClientArgs)
+	v3.New(v3.Config{})
 	if err != nil {
 		logrus.Fatal(err)
 	}
 
-	dc1, err := discoverv1.GetDiscover(config.DiscoverConfig{
-		EtcdClusterEndpoints: opt.EtcdEndpoints,
-	})
+	dc1, err := discoverv1.GetDiscover(config.DiscoverConfig{EtcdClientArgs: etcdClientArgs})
 	if err != nil {
 		logrus.Fatal(err)
 	}
 
-	dc3, err := discoverv2.GetDiscover(config.DiscoverConfig{
-		EtcdClusterEndpoints: opt.EtcdEndpoints,
-	})
+	dc3, err := discoverv2.GetDiscover(config.DiscoverConfig{EtcdClientArgs: etcdClientArgs})
 	if err != nil {
 		logrus.Fatal(err)
 	}

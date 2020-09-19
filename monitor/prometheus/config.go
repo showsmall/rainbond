@@ -20,9 +20,10 @@ package prometheus
 
 import (
 	"net/url"
-	"github.com/prometheus/common/model"
 	"regexp"
 	"time"
+
+	"github.com/prometheus/common/model"
 )
 
 // Config is the top-level configuration for Prometheus's config files.
@@ -64,7 +65,7 @@ type AlertmanagerConfig struct {
 	// values arbitrarily into the overflow maps of further-down types.
 
 	ServiceDiscoveryConfig ServiceDiscoveryConfig `yaml:",inline"`
-	HTTPClientConfig       HTTPClientConfig     `yaml:",inline"`
+	HTTPClientConfig       HTTPClientConfig       `yaml:",inline"`
 
 	// The URL scheme to use when talking to Alertmanagers.
 	Scheme string `yaml:"scheme,omitempty"`
@@ -79,21 +80,21 @@ type AlertmanagerConfig struct {
 
 // RemoteWriteConfig is the configuration for writing to remote storage.
 type RemoteWriteConfig struct {
-	URL                 *URL `yaml:"url"`
+	URL                 *URL             `yaml:"url"`
 	RemoteTimeout       model.Duration   `yaml:"remote_timeout,omitempty"`
 	WriteRelabelConfigs []*RelabelConfig `yaml:"write_relabel_configs,omitempty"`
 
 	// We cannot do proper Go type embedding below as the parser will then parse
 	// values arbitrarily into the overflow maps of further-down types.
 	HTTPClientConfig HTTPClientConfig `yaml:",inline"`
-	QueueConfig      QueueConfig                  `yaml:"queue_config,omitempty"`
+	QueueConfig      QueueConfig      `yaml:"queue_config,omitempty"`
 }
 
 // RemoteReadConfig is the configuration for reading from remote storage.
 type RemoteReadConfig struct {
-	URL           *URL `yaml:"url"`
-	RemoteTimeout model.Duration   `yaml:"remote_timeout,omitempty"`
-	ReadRecent    bool             `yaml:"read_recent,omitempty"`
+	URL           *URL           `yaml:"url"`
+	RemoteTimeout model.Duration `yaml:"remote_timeout,omitempty"`
+	ReadRecent    bool           `yaml:"read_recent,omitempty"`
 	// We cannot do proper Go type embedding below as the parser will then parse
 	// values arbitrarily into the overflow maps of further-down types.
 	HTTPClientConfig HTTPClientConfig `yaml:",inline"`
@@ -149,7 +150,7 @@ type ScrapeConfig struct {
 	// values arbitrarily into the overflow maps of further-down types.
 
 	ServiceDiscoveryConfig ServiceDiscoveryConfig `yaml:",inline"`
-	HTTPClientConfig       HTTPClientConfig     `yaml:",inline"`
+	HTTPClientConfig       HTTPClientConfig       `yaml:",inline"`
 
 	// List of target relabel configurations.
 	RelabelConfigs []*RelabelConfig `yaml:"relabel_configs,omitempty"`
@@ -181,8 +182,11 @@ type RelabelConfig struct {
 type ServiceDiscoveryConfig struct {
 	// List of labeled target groups for this job.
 	StaticConfigs []*Group `yaml:"static_configs,omitempty"`
+	// List of Kubernetes service discovery configurations.
+	KubernetesSDConfigs []*SDConfig `yaml:"kubernetes_sd_configs,omitempty"`
 }
 
+//Group group
 type Group struct {
 	// Targets is a list of targets identified by a label set. Each target is
 	// uniquely identifiable in the group by its address label.
@@ -194,10 +198,83 @@ type Group struct {
 	Source string `yaml:"source,omitempty"`
 }
 
+// SDConfig is the configuration for Kubernetes service discovery.
+type SDConfig struct {
+	Role               Role               `yaml:"role"`
+	NamespaceDiscovery NamespaceDiscovery `yaml:"namespaces,omitempty"`
+	Selectors          []SelectorConfig   `yaml:"selectors,omitempty"`
+}
+
+//SelectorConfig selector config
+type SelectorConfig struct {
+	Role  Role   `yaml:"role,omitempty"`
+	Label string `yaml:"label,omitempty"`
+	Field string `yaml:"field,omitempty"`
+}
+
+// NamespaceDiscovery is the configuration for discovering
+// Kubernetes namespaces.
+type NamespaceDiscovery struct {
+	Names []string `yaml:"names"`
+}
+
+// Role is role of the service in Kubernetes.
+type Role string
+
+// The valid options for Role.
+const (
+	RoleNode     Role = "node"
+	RolePod      Role = "pod"
+	RoleService  Role = "service"
+	RoleEndpoint Role = "endpoints"
+	RoleIngress  Role = "ingress"
+)
+
 // Regexp encapsulates a regexp.Regexp and makes it YAML marshallable.
 type Regexp struct {
 	*regexp.Regexp
 	original string
+}
+
+// NewRegexp creates a new anchored Regexp and returns an error if the
+// passed-in regular expression does not compile.
+func NewRegexp(s string) (Regexp, error) {
+	regex, err := regexp.Compile("^(?:" + s + ")$")
+	return Regexp{
+		Regexp:   regex,
+		original: s,
+	}, err
+}
+
+// MustNewRegexp works like NewRegexp, but panics if the regular expression does not compile.
+func MustNewRegexp(s string) Regexp {
+	re, err := NewRegexp(s)
+	if err != nil {
+		panic(err)
+	}
+	return re
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	r, err := NewRegexp(s)
+	if err != nil {
+		return err
+	}
+	*re = r
+	return nil
+}
+
+// MarshalYAML implements the yaml.Marshaler interface.
+func (re Regexp) MarshalYAML() (interface{}, error) {
+	if re.original != "" {
+		return re.original, nil
+	}
+	return nil, nil
 }
 
 // RelabelAction is the action to be performed on relabeling.

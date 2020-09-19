@@ -36,10 +36,11 @@ import (
 
 	_ "net/http/pprof"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	restful "github.com/emicklei/go-restful"
 	swagger "github.com/emicklei/go-restful-swagger12"
 	grpcserver "github.com/goodrain/rainbond/mq/api/grpc/server"
+	httputil "github.com/goodrain/rainbond/util/http"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
@@ -64,7 +65,7 @@ type httpServer struct {
 
 func (h *httpServer) Server() error {
 	if err := h.server.ListenAndServe(); err != nil {
-		logrus.Error("entrance api http listen error.", err.Error())
+		logrus.Error("mq api http listen error.", err.Error())
 		return err
 	}
 	return nil
@@ -84,7 +85,7 @@ type grpcServer struct {
 
 func (h *grpcServer) Server() error {
 	if err := h.server.Serve(h.lis); err != nil {
-		logrus.Error("entrance api grpc listen error.", err.Error())
+		logrus.Error("mq api grpc listen error.", err.Error())
 		return err
 	}
 	return nil
@@ -104,6 +105,8 @@ func NewManager(c option.Config) (*Manager, error) {
 		actionMQ: actionMQ,
 	}
 	go func() {
+		manager.Prometheus()
+		health()
 		if err := http.ListenAndServe(":6301", nil); err != nil {
 			logrus.Error("mq pprof listen error.", err.Error())
 		}
@@ -143,7 +146,6 @@ func (m *Manager) Start(errChan chan error) {
 	if err != nil {
 		errChan <- err
 	}
-	//m.prometheus()
 	go func() {
 		if err := m.server.Server(); err != nil {
 			logrus.Error("mq api listen error.", err.Error())
@@ -179,9 +181,18 @@ func (m *Manager) Stop() error {
 	return m.actionMQ.Stop()
 }
 
-func (m *Manager) prometheus() {
-	prometheus.MustRegister(version.NewCollector("acp_entrance"))
-	exporter := monitor.NewExporter()
+//Prometheus prometheus init
+func (m *Manager) Prometheus() {
+	prometheus.MustRegister(version.NewCollector("acp_mq"))
+	exporter := monitor.NewExporter(m.actionMQ)
 	prometheus.MustRegister(exporter)
-	m.container.Handle(m.conf.PrometheusMetricPath, promhttp.Handler())
+	http.Handle("/metrics", promhttp.Handler())
+}
+
+func health() {
+	http.HandleFunc("/health", checkHalth)
+}
+
+func checkHalth(w http.ResponseWriter, r *http.Request) {
+	httputil.ReturnSuccess(r, w, map[string]string{"status": "health", "info": "mq service health"})
 }

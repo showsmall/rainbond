@@ -27,7 +27,7 @@ import (
 
 	"github.com/jinzhu/gorm"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 //APIHandleError handle create err for api
@@ -76,7 +76,7 @@ func (a *APIHandleError) Error() string {
 }
 
 func (a *APIHandleError) String() string {
-	return fmt.Sprintf("%d:%s", a.Code, a.Err.Error())
+	return fmt.Sprintf("(Code:%d) %s", a.Code, a.Err.Error())
 }
 
 //Handle 处理

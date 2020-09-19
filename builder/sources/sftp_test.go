@@ -24,11 +24,6 @@ import (
 	"github.com/goodrain/rainbond/event"
 )
 
-func init() {
-	event.NewManager(event.EventConfig{
-		DiscoverAddress: []string{"127.0.0.1:2379"},
-	})
-}
 func TestPushFile(t *testing.T) {
 	sftpClient, err := NewSFTPClient("admin", "9bc067dc", "47.92.168.60", "20012")
 	if err != nil {

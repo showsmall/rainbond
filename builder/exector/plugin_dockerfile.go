@@ -23,18 +23,20 @@ import (
 	"os"
 	"strings"
 
+	"github.com/goodrain/rainbond/builder"
 	"github.com/goodrain/rainbond/builder/sources"
 	"github.com/goodrain/rainbond/util"
 
 	"github.com/goodrain/rainbond/db"
 	"github.com/goodrain/rainbond/event"
 
-	"github.com/docker/engine-api/types"
+	"github.com/docker/docker/api/types"
 	"github.com/pquerna/ffjson/ffjson"
 
 	"github.com/goodrain/rainbond/builder/model"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	"github.com/goodrain/rainbond/mq/api/grpc/pb"
 )
 
 const (
@@ -43,38 +45,37 @@ const (
 	formatSourceDir = "/cache/build/%s/source/%s"
 )
 
-func (e *exectorManager) pluginDockerfileBuild(in []byte) {
+func (e *exectorManager) pluginDockerfileBuild(task *pb.TaskMessage) {
 	var tb model.BuildPluginTaskBody
-	if err := ffjson.Unmarshal(in, &tb); err != nil {
+	if err := ffjson.Unmarshal(task.TaskBody, &tb); err != nil {
 		logrus.Errorf("unmarshal taskbody error, %v", err)
 		return
 	}
 	eventID := tb.EventID
 	logger := event.GetManager().GetLogger(eventID)
 	logger.Info("从dockerfile构建插件任务开始执行", map[string]string{"step": "builder-exector", "status": "starting"})
-	go func() {
-		logrus.Info("start exec build plugin from image worker")
-		defer event.GetManager().ReleaseLogger(logger)
-		for retry := 0; retry < 2; retry++ {
-			err := e.runD(&tb, logger)
-			if err != nil {
-				logrus.Errorf("exec plugin build from dockerfile error:%s", err.Error())
-				logger.Info("dockerfile构建插件任务执行失败，开始重试", map[string]string{"step": "builder-exector", "status": "failure"})
-			} else {
-				return
-			}
-		}
-		version, err := db.GetManager().TenantPluginBuildVersionDao().GetBuildVersionByDeployVersion(tb.PluginID, tb.VersionID, tb.DeployVersion)
+	logrus.Info("start exec build plugin from image worker")
+	defer event.GetManager().ReleaseLogger(logger)
+	for retry := 0; retry < 2; retry++ {
+		err := e.runD(&tb, logger)
 		if err != nil {
-			logrus.Errorf("get version error, %v", err)
+			logrus.Errorf("exec plugin build from dockerfile error:%s", err.Error())
+			logger.Info("dockerfile构建插件任务执行失败，开始重试", map[string]string{"step": "builder-exector", "status": "failure"})
+		} else {
 			return
 		}
-		version.Status = "failure"
-		if err := db.GetManager().TenantPluginBuildVersionDao().UpdateModel(version); err != nil {
-			logrus.Errorf("update version error, %v", err)
-		}
-		logger.Error("dockerfile构建插件任务执行失败", map[string]string{"step": "callback", "status": "failure"})
-	}()
+	}
+	version, err := db.GetManager().TenantPluginBuildVersionDao().GetBuildVersionByDeployVersion(tb.PluginID, tb.VersionID, tb.DeployVersion)
+	if err != nil {
+		logrus.Errorf("get version error, %v", err)
+		return
+	}
+	version.Status = "failure"
+	if err := db.GetManager().TenantPluginBuildVersionDao().UpdateModel(version); err != nil {
+		logrus.Errorf("update version error, %v", err)
+	}
+	MetricErrorTaskNum++
+	logger.Error("dockerfile构建插件任务执行失败", map[string]string{"step": "callback", "status": "failure"})
 }
 
 func (e *exectorManager) runD(t *model.BuildPluginTaskBody, logger event.Logger) error {
@@ -89,7 +90,7 @@ func (e *exectorManager) runD(t *model.BuildPluginTaskBody, logger event.Logger)
 	if err := util.CheckAndCreateDir(sourceDir); err != nil {
 		return err
 	}
-	if _, err := sources.GitClone(sources.CodeSourceInfo{RepositoryURL: t.GitURL, Branch: t.Repo}, sourceDir, logger, 4); err != nil {
+	if _, err := sources.GitClone(sources.CodeSourceInfo{RepositoryURL: t.GitURL, Branch: t.Repo, User: t.GitUsername, Password: t.GitPassword}, sourceDir, logger, 4); err != nil {
 		logger.Error("拉取代码失败", map[string]string{"step": "builder-exector", "status": "failure"})
 		logrus.Errorf("[plugin]git clone code error %v", err)
 		return err
@@ -103,7 +104,7 @@ func (e *exectorManager) runD(t *model.BuildPluginTaskBody, logger event.Logger)
 	logger.Info("代码检测为dockerfile，开始编译", map[string]string{"step": "build-exector"})
 	mm := strings.Split(t.GitURL, "/")
 	n1 := strings.Split(mm[len(mm)-1], ".")[0]
-	buildImageName := fmt.Sprintf("goodrain.me/plugin_%s_%s:%s", n1, t.PluginID, t.DeployVersion)
+	buildImageName := fmt.Sprintf(builder.REGISTRYDOMAIN+"/plugin_%s_%s:%s", n1, t.PluginID, t.DeployVersion)
 	buildOptions := types.ImageBuildOptions{
 		Tags:   []string{buildImageName},
 		Remove: true,
@@ -113,21 +114,21 @@ func (e *exectorManager) runD(t *model.BuildPluginTaskBody, logger event.Logger)
 	} else {
 		buildOptions.NoCache = false
 	}
-	logger.Info("开始构建镜像", map[string]string{"step": "builder-exector"})
-	err := sources.ImageBuild(e.DockerClient, sourceDir, buildOptions, logger, 5)
+	logger.Info("start build image", map[string]string{"step": "builder-exector"})
+	_, err := sources.ImageBuild(e.DockerClient, sourceDir, buildOptions, logger, 5)
 	if err != nil {
-		logger.Error(fmt.Sprintf("构造镜像%s失败: %s", buildImageName, err.Error()), map[string]string{"step": "builder-exector", "status": "failure"})
+		logger.Error(fmt.Sprintf("build image %s failure,find log in rbd-chaos", buildImageName), map[string]string{"step": "builder-exector", "status": "failure"})
 		logrus.Errorf("[plugin]build image error: %s", err.Error())
 		return err
 	}
-	logger.Info("镜像构建成功，开始推送镜像至仓库", map[string]string{"step": "builder-exector"})
-	err = sources.ImagePush(e.DockerClient, buildImageName, "", "", logger, 2)
+	logger.Info("build image success, start to push image to local image registry", map[string]string{"step": "builder-exector"})
+	err = sources.ImagePush(e.DockerClient, buildImageName, builder.REGISTRYUSER, builder.REGISTRYPASS, logger, 2)
 	if err != nil {
-		logger.Error("推送镜像失败", map[string]string{"step": "builder-exector"})
+		logger.Error("push image failure, find log in rbd-chaos", map[string]string{"step": "builder-exector"})
 		logrus.Errorf("push image error: %s", err.Error())
 		return err
 	}
-	logger.Info("推送镜像完成", map[string]string{"step": "build-exector"})
+	logger.Info("push image success", map[string]string{"step": "build-exector"})
 	version, err := db.GetManager().TenantPluginBuildVersionDao().GetBuildVersionByDeployVersion(t.PluginID, t.VersionID, t.DeployVersion)
 	if err != nil {
 		logrus.Errorf("get version error, %v", err)
@@ -139,7 +140,7 @@ func (e *exectorManager) runD(t *model.BuildPluginTaskBody, logger event.Logger)
 		logrus.Errorf("update version error, %v", err)
 		return err
 	}
-	logger.Info("从dockerfile构建插件完成", map[string]string{"step": "last", "status": "success"})
+	logger.Info("build plugin version by dockerfile success", map[string]string{"step": "last", "status": "success"})
 	return nil
 }
 

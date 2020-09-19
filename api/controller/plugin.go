@@ -290,7 +290,7 @@ func (t *TenantStruct) PluginBuild(w http.ResponseWriter, r *http.Request) {
 	httputil.ReturnSuccess(r, w, pbv)
 }
 
-//GetAllPluginBuildVersons 获取该插件所有的构建版本
+//GetAllPluginBuildVersions 获取该插件所有的构建版本
 // swagger:operation GET /v2/tenants/{tenant_name}/plugin/{plugin_id}/build-version v2 allPluginVersions
 //
 // 获取所有的构建版本信息
@@ -311,7 +311,7 @@ func (t *TenantStruct) PluginBuild(w http.ResponseWriter, r *http.Request) {
 //     schema:
 //       "$ref": "#/responses/commandResponse"
 //     description: 统一返回格式
-func (t *TenantStruct) GetAllPluginBuildVersons(w http.ResponseWriter, r *http.Request) {
+func (t *TenantStruct) GetAllPluginBuildVersions(w http.ResponseWriter, r *http.Request) {
 	pluginID := r.Context().Value(middleware.ContextKey("plugin_id")).(string)
 	versions, err := handler.GetPluginManager().GetAllPluginBuildVersions(pluginID)
 	if err != nil {
@@ -528,12 +528,7 @@ func (t *TenantStruct) DeletePluginRelation(w http.ResponseWriter, r *http.Reque
 	pluginID := chi.URLParam(r, "plugin_id")
 	serviceID := r.Context().Value(middleware.ContextKey("service_id")).(string)
 	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)
-	serviceAlias := r.Context().Value(middleware.ContextKey("service_alias")).(string)
-	if err := handler.GetServiceManager().TenantServiceDeletePluginRelation(serviceID, pluginID); err != nil {
-		err.Handle(r, w)
-		return
-	}
-	if err := handler.GetServiceManager().DeleteComplexEnvs(tenantID, serviceAlias, pluginID); err != nil {
+	if err := handler.GetServiceManager().TenantServiceDeletePluginRelation(tenantID, serviceID, pluginID); err != nil {
 		err.Handle(r, w)
 		return
 	}
@@ -619,10 +614,6 @@ func (t *TenantStruct) SharePlugin(w http.ResponseWriter, r *http.Request) {
 	var sp share.PluginShare
 	ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &sp.Body, nil)
 	if !ok {
-		return
-	}
-	if sp.Body.ImageInfo.HubURL == "" || sp.Body.ImageInfo.Namespace == "" {
-		httputil.ReturnError(r, w, 400, "hub url or hub namespace can not be empty")
 		return
 	}
 	tenantID := r.Context().Value(middleware.ContextKey("tenant_id")).(string)

@@ -20,29 +20,37 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/goodrain/rainbond/api/handler"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/version"
 
 	"github.com/goodrain/rainbond/util"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/goodrain/rainbond/cmd/api/option"
 
-	"github.com/goodrain/rainbond/api/apiRouters/doc"
-	"github.com/goodrain/rainbond/api/apiRouters/license"
+	"github.com/goodrain/rainbond/api/api_routers/doc"
+	"github.com/goodrain/rainbond/api/api_routers/license"
+	"github.com/goodrain/rainbond/api/metric"
 	"github.com/goodrain/rainbond/api/proxy"
 
-	"github.com/goodrain/rainbond/api/apiRouters/cloud"
-	"github.com/goodrain/rainbond/api/apiRouters/version2"
-	"github.com/goodrain/rainbond/api/apiRouters/websocket"
+	"github.com/goodrain/rainbond/api/api_routers/cloud"
+	"github.com/goodrain/rainbond/api/api_routers/version2"
+	"github.com/goodrain/rainbond/api/api_routers/websocket"
 
 	apimiddleware "github.com/goodrain/rainbond/api/middleware"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 )
@@ -55,14 +63,32 @@ type Manager struct {
 	stopChan        chan struct{}
 	r               *chi.Mux
 	prometheusProxy proxy.Proxy
+	etcdcli         *clientv3.Client
+	exporter        *metric.Exporter
 }
 
 //NewManager newManager
-func NewManager(c option.Config) *Manager {
+func NewManager(c option.Config, etcdcli *clientv3.Client) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
-	//controller.CreateV2RouterManager(c)
+	manager := &Manager{
+		ctx:      ctx,
+		cancel:   cancel,
+		conf:     c,
+		stopChan: make(chan struct{}),
+		etcdcli:  etcdcli,
+	}
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID) //每个请求的上下文中注册一个id
+	manager.r = r
+	manager.SetMiddleware()
+	return manager
+}
+
+//SetMiddleware set api meddleware
+func (m *Manager) SetMiddleware() {
+	c := m.conf
+	r := m.r
+	r.Use(m.RequestMetric)
+	r.Use(middleware.RequestID)
 	//Sets a http.Request's RemoteAddr to either X-Forwarded-For or X-Real-IP
 	r.Use(middleware.RealIP)
 	//Logs the start and end of each request with the elapsed processing time
@@ -89,22 +115,6 @@ func NewManager(c option.Config) *Manager {
 	//simple api version
 	r.Use(apimiddleware.APIVersion)
 	r.Use(apimiddleware.Proxy)
-
-	if c.Debug {
-		util.ProfilerSetup(r)
-	}
-
-	r.Get("/monitor", func(res http.ResponseWriter, req *http.Request) {
-		res.Write([]byte("ok"))
-	})
-
-	return &Manager{
-		ctx:      ctx,
-		cancel:   cancel,
-		conf:     c,
-		stopChan: make(chan struct{}),
-		r:        r,
-	}
 }
 
 //Start manager
@@ -135,8 +145,16 @@ func (m *Manager) Stop() error {
 
 //Run run
 func (m *Manager) Run() {
-
-	v2R := &version2.V2{}
+	v2R := &version2.V2{
+		Cfg: &m.conf,
+	}
+	m.Metric()
+	if m.conf.Debug {
+		util.ProfilerSetup(m.r)
+	}
+	m.r.Get("/monitor", func(res http.ResponseWriter, req *http.Request) {
+		res.Write([]byte("ok"))
+	})
 	m.r.Mount("/v2", v2R.Routes())
 	m.r.Mount("/cloud", cloud.Routes())
 	m.r.Mount("/", doc.Routes())
@@ -144,6 +162,7 @@ func (m *Manager) Run() {
 	//兼容老版docker
 	m.r.Get("/v1/etcd/event-log/instances", m.EventLogInstance)
 
+	m.r.Get("/kubernetes/dashboard", m.KuberntesDashboardAPI)
 	//prometheus单节点代理
 	m.r.Get("/api/v1/query", m.PrometheusAPI)
 	m.r.Get("/api/v1/query_range", m.PrometheusAPI)
@@ -154,38 +173,44 @@ func (m *Manager) Run() {
 		websocketRouter.Mount("/logs", websocket.LogRoutes())
 		websocketRouter.Mount("/app", websocket.AppRoutes())
 		if m.conf.WebsocketSSL {
-			logrus.Infof("websocket listen on (HTTPs) 0.0.0.0%v", m.conf.WebsocketAddr)
+			logrus.Infof("websocket listen on (HTTPs) %s", m.conf.WebsocketAddr)
 			logrus.Fatal(http.ListenAndServeTLS(m.conf.WebsocketAddr, m.conf.WebsocketCertFile, m.conf.WebsocketKeyFile, websocketRouter))
 		} else {
-			logrus.Infof("websocket listen on (HTTP) 0.0.0.0%v", m.conf.WebsocketAddr)
+			logrus.Infof("websocket listen on (HTTP) %s", m.conf.WebsocketAddr)
 			logrus.Fatal(http.ListenAndServe(m.conf.WebsocketAddr, websocketRouter))
 		}
 	}()
 	if m.conf.APISSL {
-		logrus.Infof("api listen on (HTTPs) 0.0.0.0%v", m.conf.APIAddrSSL)
-		logrus.Fatal(http.ListenAndServeTLS(m.conf.APIAddrSSL, m.conf.APICertFile, m.conf.APIKeyFile, m.r))
 		go func() {
-			logrus.Infof("api listen on (HTTP) 0.0.0.0%v", m.conf.APIAddr)
-			logrus.Fatal(http.ListenAndServe(m.conf.APIAddr, m.r))
+			pool := x509.NewCertPool()
+			caCrt, err := ioutil.ReadFile(m.conf.APICaFile)
+			if err != nil {
+				logrus.Fatal("ReadFile ca err:", err)
+				return
+			}
+			pool.AppendCertsFromPEM(caCrt)
+			s := &http.Server{
+				Addr:    m.conf.APIAddrSSL,
+				Handler: m.r,
+				TLSConfig: &tls.Config{
+					ClientCAs:  pool,
+					ClientAuth: tls.RequireAndVerifyClientCert,
+				},
+			}
+			logrus.Infof("api listen on (HTTPs) %s", m.conf.APIAddrSSL)
+			logrus.Fatal(s.ListenAndServeTLS(m.conf.APICertFile, m.conf.APIKeyFile))
 		}()
-	} else {
-		logrus.Infof("api listen on (HTTP) 0.0.0.0%v", m.conf.APIAddr)
-		logrus.Fatal(http.ListenAndServe(m.conf.APIAddr, m.r))
 	}
+	logrus.Infof("api listen on (HTTP) %s", m.conf.APIAddr)
+	logrus.Fatal(http.ListenAndServe(m.conf.APIAddr, m.r))
 }
 
 //EventLogInstance 查询event server instance
 func (m *Manager) EventLogInstance(w http.ResponseWriter, r *http.Request) {
-	etcdclient, err := clientv3.New(clientv3.Config{
-		Endpoints: m.conf.EtcdEndpoint,
-	})
-	if err != nil {
-		w.WriteHeader(500)
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(m.ctx)
 	defer cancel()
-	res, err := etcdclient.Get(ctx, "/event/instance", clientv3.WithPrefix())
+
+	res, err := m.etcdcli.Get(ctx, "/event/instance", clientv3.WithPrefix())
 	if err != nil {
 		w.WriteHeader(500)
 		return
@@ -207,4 +232,34 @@ func (m *Manager) EventLogInstance(w http.ResponseWriter, r *http.Request) {
 //PrometheusAPI prometheus api 代理
 func (m *Manager) PrometheusAPI(w http.ResponseWriter, r *http.Request) {
 	handler.GetPrometheusProxy().Proxy(w, r)
+}
+
+// KuberntesDashboardAPI proxy traffix to kubernetes dashboard
+func (m *Manager) KuberntesDashboardAPI(w http.ResponseWriter, r *http.Request) {
+	handler.GetKubernetesDashboardProxy().Proxy(w, r)
+}
+
+//Metric prometheus metric
+func (m *Manager) Metric() {
+	prometheus.MustRegister(version.NewCollector("rbd_api"))
+	exporter := metric.NewExporter()
+	m.exporter = exporter
+	prometheus.MustRegister(exporter)
+	m.r.Handle("/metrics", promhttp.Handler())
+}
+
+//RequestMetric request metric midd
+func (m *Manager) RequestMetric(next http.Handler) http.Handler {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		defer func() {
+			path := r.RequestURI
+			if strings.Index(r.RequestURI, "?") > -1 {
+				path = r.RequestURI[:strings.Index(r.RequestURI, "?")]
+			}
+			m.exporter.RequestInc(ww.Status(), path)
+		}()
+		next.ServeHTTP(ww, r)
+	}
+	return http.HandlerFunc(fn)
 }

@@ -19,25 +19,26 @@
 package exector
 
 import (
-	"time"
-
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/engine-api/client"
+	"github.com/sirupsen/logrus"
+	"github.com/docker/docker/client"
+	"github.com/goodrain/rainbond/builder"
 	"github.com/goodrain/rainbond/builder/sources"
 	"github.com/goodrain/rainbond/db"
 	"github.com/goodrain/rainbond/event"
 	"github.com/goodrain/rainbond/util"
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
-	"gopkg.in/yaml.v2"
-	"regexp"
+	yaml "gopkg.in/yaml.v2"
 )
 
 var re = regexp.MustCompile(`\s`)
@@ -86,30 +87,34 @@ func (i *ExportApp) Run(timeout time.Duration) error {
 	return errors.New("Unsupported the format: " + i.Format)
 }
 
-// 组目录命名规则，将组名中unicode转为中文，并去掉空格，"JAVA-ETCD\\u5206\\u4eab\\u7ec4" -> "JAVA-ETCD分享组"
+// exportRainbondAPP export offline rainbond app
 func (i *ExportApp) exportRainbondAPP() error {
-	// 如果该应用已经打包过且是最新版，则跳过打包并返回成功
 	if ok := i.isLatest(); ok {
 		i.updateStatus("success")
 		return nil
 	}
 
-	// 删除旧应用组目录，然后重新生成该应用包
+	// Delete the old application group directory and then regenerate the application package
 	if err := i.CleanSourceDir(); err != nil {
 		return err
 	}
 
-	// 保存用应镜像和slug包
+	// Save application attachments
 	if err := i.saveApps(); err != nil {
 		return err
 	}
 
-	// 打包整个目录为tar包
+	// Save the plugin attachments
+	if err := i.savePlugins(); err != nil {
+		return err
+	}
+
+	// zip all file
 	if err := i.zip(); err != nil {
 		return err
 	}
 
-	// 更新应用状态
+	// update export event status
 	if err := i.updateStatus("success"); err != nil {
 		return err
 	}
@@ -117,25 +122,24 @@ func (i *ExportApp) exportRainbondAPP() error {
 	return nil
 }
 
-// 组目录命名规则，将组名中unicode转为中文，并去掉空格，"JAVA-ETCD\\u5206\\u4eab\\u7ec4" -> "JAVA-ETCD分享组"
+//  exportDockerCompose export app to docker compose app
 func (i *ExportApp) exportDockerCompose() error {
-	// 如果该应用已经打包过且是最新版，则跳过打包并返回成功
 	if ok := i.isLatest(); ok {
 		i.updateStatus("success")
 		return nil
 	}
 
-	// 删除旧应用组目录，然后重新生成该应用包
+	// Delete the old application group directory and then regenerate the application package
 	if err := i.CleanSourceDir(); err != nil {
 		return err
 	}
 
-	// 保存用应镜像和slug包
+	// Save application attachments
 	if err := i.saveApps(); err != nil {
 		return err
 	}
 
-	// 当导出格式为docker-compose时，需要导出runner镜像
+	// Save runner image name
 	if err := i.exportRunnerImage(); err != nil {
 		return err
 	}
@@ -178,25 +182,28 @@ func (i *ExportApp) GetLogger() event.Logger {
 	return i.Logger
 }
 
-// isLatest 如果该应用已经打包过且是最新版则返回true
+// isLatest Returns true if the application is packaged and up to date
 func (i *ExportApp) isLatest() bool {
 	md5File := fmt.Sprintf("%s/metadata.json.md5", i.SourceDir)
-
 	if _, err := os.Stat(md5File); os.IsNotExist(err) {
 		logrus.Debug("The export app md5 file is not found: ", md5File)
 		return false
 	}
-
 	err := exec.Command("md5sum", "-c", md5File).Run()
 	if err != nil {
+		tarFile := i.SourceDir + ".tar"
+		if _, err := os.Stat(tarFile); os.IsNotExist(err) {
+			logrus.Debug("The export app tar file is not found. ")
+			return false
+		}
 		logrus.Debug("The export app tar file is not latest.")
 		return false
 	}
-
 	logrus.Debug("The export app tar file is latest.")
 	return true
 }
 
+//CleanSourceDir clean export dir
 func (i *ExportApp) CleanSourceDir() error {
 	logrus.Debug("Ready clean the source directory.")
 	metaFile := fmt.Sprintf("%s/metadata.json", i.SourceDir)
@@ -232,7 +239,7 @@ func (i *ExportApp) parseApps() ([]gjson.Result, error) {
 	arr := gjson.GetBytes(data, "apps").Array()
 	if len(arr) < 1 {
 		i.Logger.Error("解析应用列表信息失败", map[string]string{"step": "parse-apps", "status": "failure"})
-		err := errors.New("Not found app in the metadata.")
+		err := errors.New("Not found app in the metadata")
 		logrus.Error("Failed to get apps from json: ", err)
 		return nil, err
 	}
@@ -241,127 +248,173 @@ func (i *ExportApp) parseApps() ([]gjson.Result, error) {
 	return arr, nil
 }
 
-func (i *ExportApp) exportImage(app gjson.Result) error {
+//exportImage export image of app
+func (i *ExportApp) exportImage(serviceDir string, app gjson.Result) error {
 	serviceName := app.Get("service_cname").String()
 	serviceName = unicode2zh(serviceName)
-
-	serviceDir := fmt.Sprintf("%s/%s", i.SourceDir, serviceName)
 	os.MkdirAll(serviceDir, 0755)
-
-	// 处理掉文件名中冒号等不合法字符
 	image := app.Get("share_image").String()
 	tarFileName := buildToLinuxFileName(image)
-
-	// 如果是runner镜像则跳过
+	user, pass := builder.GetImageUserInfo(app.Get("service_image.hub_user").String(), app.Get("service_image.hub_password").String())
+	// ignore runner image
 	if checkIsRunner(image) {
 		logrus.Debug("Skip the runner image: ", image)
 		return nil
 	}
-
 	// docker pull image-name
-	_, err := sources.ImagePull(i.DockerClient, image, "", "", i.Logger, 15)
+	_, err := sources.ImagePull(i.DockerClient, image, user, pass, i.Logger, 15)
 	if err != nil {
-		// 处理掉文件名中冒号等不合法字符
-		image = app.Get("image").String()
-		tarFileName = buildToLinuxFileName(image)
-
-		// docker pull image-name
-		_, err := sources.ImagePull(i.DockerClient, image, "", "", i.Logger, 15)
-		if err != nil {
-			i.Logger.Error(fmt.Sprintf("拉取镜像失败：%s", image),
-				map[string]string{"step": "pull-image", "status": "failure"})
-			logrus.Error("Failed to pull image: ", err)
-		}
+		return err
 	}
-
+	//change save app image name
+	saveImageName := sources.GenSaveImageName(image)
+	if err := sources.ImageTag(i.DockerClient, image, saveImageName, i.Logger, 2); err != nil {
+		return err
+	}
 	// save image to tar file
-	err = sources.ImageSave(i.DockerClient, image, fmt.Sprintf("%s/%s.image.tar", serviceDir, tarFileName), i.Logger)
+	err = sources.ImageSave(i.DockerClient, saveImageName, fmt.Sprintf("%s/%s.image.tar", serviceDir, tarFileName), i.Logger)
 	if err != nil {
-		i.Logger.Error(fmt.Sprintf("保存镜像失败：%s", image),
+		i.Logger.Error(fmt.Sprintf("save image to local error：%s", image),
 			map[string]string{"step": "save-image", "status": "failure"})
 		logrus.Error("Failed to save image: ", err)
 		return err
 	}
 	logrus.Debug("Successful save image file: ", image)
+	return nil
+}
+
+func (i *ExportApp) exportSlug(serviceDir string, app gjson.Result) error {
+	shareSlugPath := app.Get("share_slug_path").String()
+	serviceName := app.Get("service_cname").String()
+	tarFileName := buildToLinuxFileName(shareSlugPath)
+	_, err := os.Stat(shareSlugPath)
+	if shareSlugPath != "" && err == nil {
+		logrus.Debug("The slug file was exist already, direct copy to service dir: ", shareSlugPath)
+		err = util.CopyFile(shareSlugPath, fmt.Sprintf("%s/%s", serviceDir, tarFileName))
+		if err == nil {
+			return nil
+		}
+		// if local copy failure, try download it
+		logrus.Debugf("Failed to copy the slug file to service dir %s: %v", shareSlugPath, err)
+	}
+	// get slug save server (ftp) info
+	ftpHost := app.Get("service_slug.ftp_host").String()
+	ftpPort := app.Get("service_slug.ftp_port").String()
+	ftpUsername := app.Get("service_slug.ftp_username").String()
+	ftpPassword := app.Get("service_slug.ftp_password").String()
+
+	ftpClient, err := sources.NewSFTPClient(ftpUsername, ftpPassword, ftpHost, ftpPort)
+	if err != nil {
+		logrus.Error("Failed to create ftp client: ", err)
+		return err
+	}
+	// download slug file
+	i.Logger.Info(fmt.Sprintf("Download service %s slug file", serviceName), map[string]string{"step": "get-slug", "status": "failure"})
+	err = ftpClient.DownloadFile(shareSlugPath, fmt.Sprintf("%s/%s", serviceDir, tarFileName), i.Logger)
+	ftpClient.Close()
+	if err != nil {
+		logrus.Errorf("Failed to download slug file for group %s: %v", i.SourceDir, err)
+		return err
+	}
+	logrus.Debug("Successful download slug file: ", shareSlugPath)
+	return nil
+}
+
+func (i *ExportApp) exportConfigFile(serviceDir string, v gjson.Result) error {
+	if v.Get("volume_type").String() != "config-file" {
+		return nil
+	}
+	serviceDir = strings.TrimRight(serviceDir, "/")
+	fc := v.Get("file_content").String()
+	vp := v.Get("volume_path").String()
+	filename := fmt.Sprintf("%s%s", serviceDir, vp)
+	dir := path.Dir(filename)
+	os.MkdirAll(dir, 0755)
+	return ioutil.WriteFile(filename, []byte(fc), 0644)
+}
+
+func (i *ExportApp) savePlugins() error {
+	i.Logger.Info("Parsing plugin information", map[string]string{"step": "export-plugins", "status": "success"})
+
+	data, err := ioutil.ReadFile(fmt.Sprintf("%s/metadata.json", i.SourceDir))
+	if err != nil {
+		i.Logger.Error("导出插件失败，没有找到应用信息", map[string]string{"step": "read-metadata", "status": "failure"})
+		logrus.Error("Failed to read metadata file: ", err)
+		return err
+	}
+
+	plugins := gjson.GetBytes(data, "plugins").Array()
+
+	for _, plugin := range plugins {
+		pluginName := plugin.Get("plugin_name").String()
+		pluginName = unicode2zh(pluginName)
+		pluginDir := fmt.Sprintf("%s/%s", i.SourceDir, pluginName)
+		os.MkdirAll(pluginDir, 0755)
+		image := plugin.Get("share_image").String()
+		tarFileName := buildToLinuxFileName(image)
+		user, pass := builder.GetImageUserInfo(plugin.Get("plugin_image.hub_user").String(), plugin.Get("plugin_image.hub_password").String())
+		// docker pull image-name
+		_, err := sources.ImagePull(i.DockerClient, image, user, pass, i.Logger, 15)
+		if err != nil {
+			return err
+		}
+		//change save app image name
+		saveImageName := sources.GenSaveImageName(image)
+		if err := sources.ImageTag(i.DockerClient, image, saveImageName, i.Logger, 2); err != nil {
+			return err
+		}
+		// save image to tar file
+		err = sources.ImageSave(i.DockerClient, saveImageName, fmt.Sprintf("%s/%s.image.tar", pluginDir, tarFileName), i.Logger)
+		if err != nil {
+			i.Logger.Error(fmt.Sprintf("save plugin image to local error：%s", image),
+				map[string]string{"step": "save-plugin-image", "status": "failure"})
+			logrus.Error("Failed to save plugin image: ", err)
+			return err
+		}
+		logrus.Debug("Successful save plugin image file: ", image)
+	}
 
 	return nil
 }
 
-// 下载组件相的镜像，如果该组件是源码方式部署，则下载相应slug文件
-// 组件目录命名规则：将组件名中unicode转为中文，并去掉空格，"2048\\u5e94\\u7528" -> "2048应用"
-// 镜像包命名规则: goodrain.me/percona-mysql:5.5_latest -> percona-mysqlTAG5.5_latest.image.tar
-// slug包命名规则: /app_publish/vzrd9po6/9d2635a7c59d4974bb4dc62f04/v1.0_20180207165207.tgz -> v1.0_20180207165207.tgz
+// save all app attachment
+// dir naming rule：Convert unicode to Chinese in the component name and remove the empty，"2048\\u5e94\\u7528" -> "2048应用"
+// Image naming rule: goodrain.me/percona-mysql:5.5_latest -> percona-mysqlTAG5.5_latest.image.tar
+// slug naming rule: /app_publish/vzrd9po6/9d2635a7c59d4974bb4dc62f04/v1.0_20180207165207.tgz -> v1.0_20180207165207.tgz
 func (i *ExportApp) saveApps() error {
 	apps, err := i.parseApps()
 	if err != nil {
 		return err
 	}
 
-	i.Logger.Info("开始打包应用", map[string]string{"step": "export-app", "status": "success"})
+	i.Logger.Info("Start export app", map[string]string{"step": "export-app", "status": "success"})
 
 	for _, app := range apps {
 		serviceName := app.Get("service_cname").String()
 		serviceName = unicode2zh(serviceName)
-
 		serviceDir := fmt.Sprintf("%s/%s", i.SourceDir, serviceName)
 		os.MkdirAll(serviceDir, 0755)
+		logrus.Debug("Create directory for export app: ", serviceDir)
+		shareImage := app.Get("share_image").String()
 
-		logrus.Debug("Create directory for service: ", serviceDir)
-
-		// 如果该slug文件存在于本地，则直接复制，然后修改json中的share_slug_path字段
-		shareSlugPath := app.Get("share_slug_path").String()
-		tarFileName := buildToLinuxFileName(shareSlugPath)
-		_, err := os.Stat(shareSlugPath)
-		if shareSlugPath != "" && err == nil {
-			logrus.Debug("The slug file was exist already, direct copy to service dir: ", shareSlugPath)
-			err = exec.Command("cp", shareSlugPath, fmt.Sprintf("%s/%s", serviceDir, tarFileName)).Run()
-			if err == nil {
-				continue
+		volumes := app.Get("service_volume_map_list").Array()
+		if volumes != nil && len(volumes) > 0 {
+			for _, v := range volumes {
+				err := i.exportConfigFile(serviceDir, v)
+				if err != nil {
+					logrus.Errorf("error exporting config file: %v", err)
+					return err
+				}
 			}
-			// 如果copy失败则忽略，在下一步中下载该slug包
-			logrus.Debugf("Failed to copy the slug file to service dir %s: %v", shareSlugPath, err)
 		}
-
-		// 如果这个字段存在于该app中，则认为该app是源码部署方式，并从ftp下载相应slug文件
-		// 否则认为该app是镜像方式部署，然后下载相应镜像即可
-		if shareSlugPath == "" {
+		if shareImage != "" {
 			logrus.Infof("The service is image model deploy: %s", serviceName)
-			// 下载镜像到应用导出目录
-			if err := i.exportImage(app); err != nil {
+			// app is image type
+			if err := i.exportImage(serviceDir, app); err != nil {
 				return err
 			}
-
 			continue
 		}
-
-		i.Logger.Info(fmt.Sprintf("解析应用源码信息：%s", serviceName),
-			map[string]string{"step": "parse-slug", "status": "failure"})
-		logrus.Debug("Ready download slug file: ", shareSlugPath)
-
-		// 提取tfp服务器信息
-		ftpHost := app.Get("service_slug.ftp_host").String()
-		ftpPort := app.Get("service_slug.ftp_port").String()
-		ftpUsername := app.Get("service_slug.ftp_username").String()
-		ftpPassword := app.Get("service_slug.ftp_password").String()
-
-		ftpClient, err := sources.NewSFTPClient(ftpUsername, ftpPassword, ftpHost, ftpPort)
-		if err != nil {
-			logrus.Error("Failed to create ftp client: ", err)
-			return err
-		}
-
-		// 开始下载文件
-		i.Logger.Info(fmt.Sprintf("获取应用源码：%s", serviceName),
-			map[string]string{"step": "get-slug", "status": "failure"})
-
-		err = ftpClient.DownloadFile(shareSlugPath, fmt.Sprintf("%s/%s", serviceDir, tarFileName), i.Logger)
-		ftpClient.Close()
-		if err != nil {
-			logrus.Errorf("Failed to download slug file for group %s: %v", i.SourceDir, err)
-			return err
-		}
-		logrus.Debug("Successful download slug file: ", shareSlugPath)
-
 	}
 	return nil
 }
@@ -398,60 +451,57 @@ func unicode2zh(uText string) (context string) {
 }
 
 func checkIsRunner(image string) bool {
-	return strings.Contains(image, "/runner")
+	return strings.Contains(image, builder.RUNNERIMAGENAME)
 }
 
 func (i *ExportApp) exportRunnerImage() error {
 	isExist := false
 	var image, tarFileName string
-
 	logrus.Debug("Ready export runner image")
 	apps, err := i.parseApps()
 	if err != nil {
 		return err
 	}
-
 	for _, app := range apps {
 		image = app.Get("image").String()
 		tarFileName = buildToLinuxFileName(image)
-		if checkIsRunner(image) {
+		lang := app.Get("language").String()
+		if lang != "dockerfile" && checkIsRunner(image) {
 			logrus.Debug("Discovered runner image at service: ", app.Get("service_cname"))
 			isExist = true
 			break
 		}
 	}
-
 	if !isExist {
 		logrus.Debug("Not discovered runner image in any service.")
 		return nil
 	}
-
-	_, err = sources.ImagePull(i.DockerClient, image, "", "", i.Logger, 10)
+	_, err = sources.ImagePull(i.DockerClient, image, builder.REGISTRYUSER, builder.REGISTRYPASS, i.Logger, 20)
 	if err != nil {
-		i.Logger.Error(fmt.Sprintf("拉取镜像失败：%s", image),
+		i.Logger.Error(fmt.Sprintf("Pull image failure：%s", image),
 			map[string]string{"step": "pull-image", "status": "failure"})
 		logrus.Error("Failed to pull image: ", err)
 	}
 
 	err = sources.ImageSave(i.DockerClient, image, fmt.Sprintf("%s/%s.image.tar", i.SourceDir, tarFileName), i.Logger)
 	if err != nil {
-		i.Logger.Error(fmt.Sprintf("保存镜像失败：%s", image),
+		i.Logger.Error(fmt.Sprintf("Save image failure：%s", image),
 			map[string]string{"step": "save-image", "status": "failure"})
 		logrus.Error("Failed to save image: ", err)
 		return err
 	}
-
 	logrus.Debug("Successful download runner image: ", image)
-
 	return nil
 }
 
+//DockerComposeYaml docker compose struct
 type DockerComposeYaml struct {
 	Version  string              `yaml:"version"`
 	Volumes  map[string]string   `yaml:"volumes,omitempty"`
 	Services map[string]*Service `yaml:"services,omitempty"`
 }
 
+//Service service
 type Service struct {
 	Image         string            `yaml:"image"`
 	ContainerName string            `yaml:"container_name,omitempty"`
@@ -460,6 +510,7 @@ type Service struct {
 	Volumes       []string          `yaml:"volumes,omitempty"`
 	Command       string            `yaml:"command,omitempty"`
 	Environment   map[string]string `yaml:"environment,omitempty"`
+	DependsOn     []string          `yaml:"depends_on,omitempty"`
 	Loggin        struct {
 		Driver  string `yaml:"driver,omitempty"`
 		Options struct {
@@ -487,6 +538,7 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 
 	for _, app := range apps {
 		image := app.Get("image").String()
+		shareImage := app.Get("share_image").String()
 		appName := app.Get("service_cname").String()
 		appName = unicode2zh(appName)
 		volumes := make([]string, 0, 3)
@@ -499,13 +551,19 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 			volumeName := item.Get("volume_name").String()
 			volumeName = buildToLinuxFileName(volumeName)
 			volumePath := item.Get("volume_path").String()
-
-			y.Volumes[volumeName] = ""
-			volumes = append(volumes, fmt.Sprintf("%s:%s", volumeName, volumePath))
+			if item.Get("volume_type").String() == "config-file" {
+				volume := fmt.Sprintf("__GROUP_DIR__/%s/%s:%s", appName, volumePath, volumePath)
+				volumes = append(volumes, volume)
+			} else {
+				y.Volumes[volumeName] = ""
+				volumes = append(volumes, fmt.Sprintf("%s:%s", volumeName, volumePath))
+			}
 		}
 
+		lang := app.Get("language").String()
 		// 如果该组件是源码方式部署，则挂载slug文件到runner容器内
-		if checkIsRunner(image) {
+		if lang != "dockerfile" && checkIsRunner(image) {
+			shareImage = image
 			shareSlugPath := app.Get("share_slug_path").String()
 			tarFileName := buildToLinuxFileName(shareSlugPath)
 			volume := fmt.Sprintf("__GROUP_DIR__/%s/%s:/tmp/slug/slug.tgz", appName, tarFileName)
@@ -514,8 +572,10 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 		}
 
 		// 处理环境变量
-		for k, v := range app.Get("service_env_map_list").Map() {
-			envs[k] = v.String()
+		for _, item := range app.Get("service_env_map_list").Array() {
+			key := item.Get("attr_name").String()
+			value := item.Get("attr_value").String()
+			envs[key] = value
 		}
 
 		for _, item := range app.Get("service_connect_info_map_list").Array() {
@@ -524,6 +584,7 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 			envs[key] = value
 		}
 
+		var depServices []string
 		// 如果该app依赖了另了个app-b，则把app-b中所有公开环境变量注入到该app
 		for _, item := range app.Get("dep_service_map_list").Array() {
 			serviceKey := item.Get("dep_service_key").String()
@@ -531,10 +592,14 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 			for k, v := range depEnvs {
 				envs[k] = v
 			}
+
+			if svc := i.getDependedService(serviceKey, &apps); svc != "" {
+				depServices = append(depServices, svc)
+			}
 		}
 
 		service := &Service{
-			Image:         image,
+			Image:         sources.GenSaveImageName(shareImage),
 			ContainerName: appName,
 			Restart:       "always",
 			NetworkMode:   "host",
@@ -545,6 +610,9 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 		service.Loggin.Driver = "json-file"
 		service.Loggin.Options.MaxSize = "5m"
 		service.Loggin.Options.MaxFile = "2"
+		if depServices != nil && len(depServices) > 0 {
+			service.DependsOn = depServices
+		}
 
 		y.Services[appName] = service
 	}
@@ -569,7 +637,7 @@ func (i *ExportApp) buildDockerComposeYaml() error {
 func (i *ExportApp) getPublicEnvByKey(serviceKey string, apps *[]gjson.Result) map[string]string {
 	envs := make(map[string]string, 5)
 	for _, app := range *apps {
-		appKey := app.Get("service_key").String()
+		appKey := app.Get("service_share_uuid").String()
 		if appKey == serviceKey {
 			for _, item := range app.Get("service_connect_info_map_list").Array() {
 				key := item.Get("attr_name").String()
@@ -581,6 +649,15 @@ func (i *ExportApp) getPublicEnvByKey(serviceKey string, apps *[]gjson.Result) m
 	}
 
 	return envs
+}
+
+func (i *ExportApp) getDependedService(key string, apps *[]gjson.Result) string {
+	for _, app := range *apps {
+		if key == app.Get("service_share_uuid").String() {
+			return app.Get("service_cname").String()
+		}
+	}
+	return ""
 }
 
 func (i *ExportApp) buildStartScript() error {
@@ -596,18 +673,18 @@ func (i *ExportApp) buildStartScript() error {
 
 //ErrorCallBack if run error will callback
 func (i *ExportApp) ErrorCallBack(err error) {
-
+	i.updateStatus("failed")
 }
 
 func (i *ExportApp) zip() error {
-	err := util.Zip(i.SourceDir, i.SourceDir+".tar")
+	err := util.Zip(i.SourceDir, i.SourceDir+".zip")
 	if err != nil {
-		i.Logger.Error("打包应用失败", map[string]string{"step": "export-app", "status": "failure"})
+		i.Logger.Error("Export application failure:Zip failure", map[string]string{"step": "export-app", "status": "failure"})
 		logrus.Errorf("Failed to create tar file for group %s: %v", i.SourceDir, err)
 		return err
 	}
 
-	// 生成MD5值并写入到文件，以便在下次收到该请求时决定是否该重新打包该应用
+	// create md5 file
 	metadataFile := fmt.Sprintf("%s/metadata.json", i.SourceDir)
 	if err := exec.Command("sh", "-c", fmt.Sprintf("md5sum %s > %s.md5", metadataFile, metadataFile)).Run(); err != nil {
 		err = errors.New(fmt.Sprintf("Failed to create md5 file: %v", err))
@@ -615,30 +692,25 @@ func (i *ExportApp) zip() error {
 		return err
 	}
 
-	i.Logger.Info("打包应用成功", map[string]string{"step": "export-app", "status": "success"})
+	i.Logger.Info("Export application success", map[string]string{"step": "export-app", "status": "success"})
 	logrus.Info("Successful export app by event id: ", i.EventID)
 	return nil
 }
 
 func (i *ExportApp) updateStatus(status string) error {
 	logrus.Debug("Update app status in database to: ", status)
-	// 从数据库中获取该应用的状态信息
 	res, err := db.GetManager().AppDao().GetByEventId(i.EventID)
 	if err != nil {
 		err = errors.New(fmt.Sprintf("Failed to get app %s from db: %v", i.EventID, err))
 		logrus.Error(err)
 		return err
 	}
-
-	// 在数据库中更新该应用的状态信息
 	res.Status = status
-
 	if err := db.GetManager().AppDao().UpdateModel(res); err != nil {
 		err = errors.New(fmt.Sprintf("Failed to update app %s: %v", i.EventID, err))
 		logrus.Error(err)
 		return err
 	}
-
 	return nil
 }
 

@@ -23,24 +23,32 @@ import (
 	"io/ioutil"
 	"path"
 
-	"github.com/Sirupsen/logrus"
-
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/util"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 //RainbondFileConfig 云帮源码配置文件
 type RainbondFileConfig struct {
-	Language  string            `yaml:"language"`
-	BuildPath string            `yaml:"buildpath"`
-	Ports     []Port            `yaml:"ports"`
-	Envs      map[string]string `yaml:"envs"`
+	Language  string                 `yaml:"language"`
+	BuildPath string                 `yaml:"buildpath"`
+	Ports     []Port                 `yaml:"ports"`
+	Envs      map[string]interface{} `yaml:"envs"`
+	Cmd       string                 `yaml:"cmd"`
+	Services  []*Service             `yaml:"services"`
+}
+
+// Service contains
+type Service struct {
+	Name  string            `yaml:"name"`
+	Ports []Port            `yaml:"ports"`
+	Envs  map[string]string `yaml:"envs"`
 }
 
 //Port Port
 type Port struct {
 	Port     int    `yaml:"port"`
-	Protocol string `yaml:"procotol"`
+	Protocol string `yaml:"protocol"`
 }
 
 //ReadRainbondFile 读取云帮代码配置

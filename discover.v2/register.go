@@ -24,33 +24,32 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
 	client "github.com/coreos/etcd/clientv3"
-	etcdnaming "github.com/coreos/etcd/clientv3/naming"
 	"github.com/goodrain/rainbond/util"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
+	grpcutil "github.com/goodrain/rainbond/util/grpc"
 	"google.golang.org/grpc/naming"
 )
 
 //KeepAlive 服务注册
 type KeepAlive struct {
-	EtcdEndpoint []string
-	ServerName   string
-	HostName     string
-	Endpoint     string
-	TTL          int64
-	LID          clientv3.LeaseID
-	Done         chan struct{}
-	etcdClient   *client.Client
-	gRPCResolver *etcdnaming.GRPCResolver
-	once         sync.Once
+	cancel         context.CancelFunc
+	EtcdClientArgs *etcdutil.ClientArgs
+	ServerName     string
+	HostName       string
+	Endpoint       string
+	TTL            int64
+	LID            clientv3.LeaseID
+	Done           chan struct{}
+	etcdClient     *client.Client
+	gRPCResolver   *grpcutil.GRPCResolver
+	once           sync.Once
 }
 
 //CreateKeepAlive create keepalive for server
-func CreateKeepAlive(EtcdEndpoint []string, ServerName string, Protocol string, HostIP string, Port int) (*KeepAlive, error) {
-	if len(EtcdEndpoint) == 0 {
-		EtcdEndpoint = []string{"127.0.0.1:2379"}
-	}
+func CreateKeepAlive(etcdClientArgs *etcdutil.ClientArgs, ServerName string, Protocol string, HostIP string, Port int) (*KeepAlive, error) {
 	if ServerName == "" || Port == 0 {
 		return nil, fmt.Errorf("servername or serverport can not be empty")
 	}
@@ -63,12 +62,21 @@ func CreateKeepAlive(EtcdEndpoint []string, ServerName string, Protocol string, 
 		HostIP = ip.String()
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	etcdclient, err := etcdutil.NewClient(ctx, etcdClientArgs)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	k := &KeepAlive{
-		EtcdEndpoint: EtcdEndpoint,
-		ServerName:   ServerName,
-		Endpoint:     fmt.Sprintf("%s:%d", HostIP, Port),
-		TTL:          5,
-		Done:         make(chan struct{}),
+		EtcdClientArgs: etcdClientArgs,
+		ServerName:     ServerName,
+		Endpoint:       fmt.Sprintf("%s:%d", HostIP, Port),
+		TTL:            5,
+		Done:           make(chan struct{}),
+		etcdClient:     etcdclient,
+		cancel:         cancel,
 	}
 	if Protocol == "" {
 		k.Endpoint = fmt.Sprintf("%s:%d", HostIP, Port)
@@ -82,13 +90,7 @@ func CreateKeepAlive(EtcdEndpoint []string, ServerName string, Protocol string, 
 func (k *KeepAlive) Start() error {
 	duration := time.Duration(k.TTL) * time.Second
 	timer := time.NewTimer(duration)
-	etcdclient, err := client.New(client.Config{
-		Endpoints: k.EtcdEndpoint,
-	})
-	if err != nil {
-		return err
-	}
-	k.etcdClient = etcdclient
+
 	go func() {
 		for {
 			select {
@@ -126,10 +128,9 @@ func (k *KeepAlive) etcdKey() string {
 }
 
 func (k *KeepAlive) reg() error {
-	k.gRPCResolver = &etcdnaming.GRPCResolver{Client: k.etcdClient}
+	k.gRPCResolver = &grpcutil.GRPCResolver{Client: k.etcdClient}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-
 	resp, err := k.etcdClient.Grant(ctx, k.TTL+3)
 	if err != nil {
 		return err
@@ -146,12 +147,16 @@ func (k *KeepAlive) reg() error {
 func (k *KeepAlive) Stop() {
 	k.once.Do(func() {
 		close(k.Done)
+		k.cancel()
+
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 		defer cancel()
-		if err := k.gRPCResolver.Update(ctx, k.etcdKey(), naming.Update{Op: naming.Delete, Addr: k.Endpoint}); err != nil {
-			logrus.Errorf("cancel %s server endpoint %s from etcd error %s", k.ServerName, k.Endpoint, err.Error())
-		} else {
-			logrus.Infof("cancel %s server endpoint %s from etcd", k.ServerName, k.Endpoint)
+		if k.gRPCResolver != nil {
+			if err := k.gRPCResolver.Update(ctx, k.etcdKey(), naming.Update{Op: naming.Delete, Addr: k.Endpoint}); err != nil {
+				logrus.Errorf("cancel %s server endpoint %s from etcd error %s", k.ServerName, k.Endpoint, err.Error())
+			} else {
+				logrus.Infof("cancel %s server endpoint %s from etcd", k.ServerName, k.Endpoint)
+			}
 		}
 	})
 }

@@ -20,15 +20,16 @@ package server
 
 import (
 	"context"
-	"github.com/goodrain/rainbond/eventlog/conf"
-	"github.com/goodrain/rainbond/eventlog/store"
 	"fmt"
 	"io"
 	"net"
 
+	"github.com/goodrain/rainbond/eventlog/conf"
+	"github.com/goodrain/rainbond/eventlog/store"
+
 	"github.com/goodrain/rainbond/eventlog/entry/grpc/pb"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
@@ -60,7 +61,7 @@ func NewServer(conf conf.EventLogServerConf, log *logrus.Entry, storeManager sto
 
 //Start start grpc server
 func (s *EventLogRPCServer) Start() error {
-	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.conf.BindIP, s.conf.BindPort+1))
+	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.conf.BindIP, s.conf.BindPort))
 	if err != nil {
 		logrus.Errorf("failed to listen: %v", err)
 		return err
@@ -70,13 +71,11 @@ func (s *EventLogRPCServer) Start() error {
 	pb.RegisterEventLogServer(server, s)
 	// Register reflection service on gRPC server.
 	reflection.Register(server)
-	go func() {
-		if err := server.Serve(lis); err != nil {
-			s.log.Error("event log api grpc listen error.", err.Error())
-			s.listenErr <- err
-		}
-	}()
-	s.log.Infof("event message grpc server listen %s:%d", s.conf.BindIP, s.conf.BindPort+1)
+	s.log.Infof("event message grpc server listen %s:%d", s.conf.BindIP, s.conf.BindPort)
+	if err := server.Serve(lis); err != nil {
+		s.log.Error("event log api grpc listen error.", err.Error())
+		s.listenErr <- err
+	}
 	return nil
 }
 
@@ -110,7 +109,6 @@ func (s *EventLogRPCServer) Log(stream pb.EventLog_LogServer) error {
 			}
 			return err
 		}
-		s.log.Debug(string(log.Log))
 		select {
 		case s.messageChan <- log.Log:
 		default:

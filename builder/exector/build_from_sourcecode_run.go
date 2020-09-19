@@ -19,50 +19,52 @@
 package exector
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
-	"regexp"
 	"strings"
 	"time"
 
-	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/goodrain/rainbond/util"
-
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	"github.com/docker/docker/client"
+	"github.com/goodrain/rainbond/builder"
+	"github.com/goodrain/rainbond/builder/build"
+	"github.com/goodrain/rainbond/builder/parser"
 	"github.com/goodrain/rainbond/builder/parser/code"
-	"github.com/goodrain/rainbond/event"
-	"github.com/pquerna/ffjson/ffjson"
-	"github.com/tidwall/gjson"
-	//"github.com/docker/docker/api/types"
-	"github.com/docker/engine-api/types"
-	//"github.com/docker/docker/client"
-
-	"github.com/docker/engine-api/client"
-	"github.com/goodrain/rainbond/builder/apiHandler"
 	"github.com/goodrain/rainbond/builder/sources"
 	"github.com/goodrain/rainbond/db"
 	dbmodel "github.com/goodrain/rainbond/db/model"
-	"github.com/goodrain/rainbond/worker/discover/model"
+	"github.com/goodrain/rainbond/event"
+	"github.com/goodrain/rainbond/util"
+	"github.com/pquerna/ffjson/ffjson"
+	"github.com/tidwall/gjson" //"github.com/docker/docker/api/types"
+	"k8s.io/client-go/kubernetes"
+	//"github.com/docker/docker/client"
 )
-
-//REGISTRYDOMAIN REGISTRY_DOMAIN
-var REGISTRYDOMAIN = "goodrain.me"
 
 //SourceCodeBuildItem SouceCodeBuildItem
 type SourceCodeBuildItem struct {
-	Namespace    string       `json:"namespace"`
-	TenantName   string       `json:"tenant_name"`
-	ServiceAlias string       `json:"service_alias"`
-	Action       string       `json:"action"`
-	DestImage    string       `json:"dest_image"`
-	Logger       event.Logger `json:"logger"`
-	EventID      string       `json:"event_id"`
-	CacheDir     string       `json:"cache_dir"`
+	Namespace     string       `json:"namespace"`
+	TenantName    string       `json:"tenant_name"`
+	GRDataPVCName string       `json:"gr_data_pvc_name"`
+	CachePVCName  string       `json:"cache_pvc_name"`
+	CacheMode     string       `json:"cache_mode"`
+	CachePath     string       `json:"cache_path"`
+	ServiceAlias  string       `json:"service_alias"`
+	Action        string       `json:"action"`
+	DestImage     string       `json:"dest_image"`
+	Logger        event.Logger `json:"logger"`
+	EventID       string       `json:"event_id"`
+	CacheDir      string       `json:"cache_dir"`
 	//SourceDir     string       `json:"source_dir"`
 	TGZDir        string `json:"tgz_dir"`
 	DockerClient  *client.Client
+	KubeClient    kubernetes.Interface
+	RbdNamespace  string
+	RbdRepoName   string
 	TenantID      string
 	ServiceID     string
 	DeployVersion string
@@ -71,7 +73,16 @@ type SourceCodeBuildItem struct {
 	BuildEnvs     map[string]string
 	CodeSouceInfo sources.CodeSourceInfo
 	RepoInfo      *sources.RepostoryBuildInfo
-	commit        *object.Commit
+	commit        Commit
+	Configs       map[string]gjson.Result `json:"configs"`
+	Ctx           context.Context
+}
+
+//Commit code Commit
+type Commit struct {
+	Hash    string
+	Author  string
+	Message string
 }
 
 //NewSouceCodeBuildItem create
@@ -79,12 +90,13 @@ func NewSouceCodeBuildItem(in []byte) *SourceCodeBuildItem {
 	eventID := gjson.GetBytes(in, "event_id").String()
 	logger := event.GetManager().GetLogger(eventID)
 	csi := sources.CodeSourceInfo{
-		ServerType:    gjson.GetBytes(in, "server_type").String(),
+		ServerType:    strings.Replace(gjson.GetBytes(in, "server_type").String(), " ", "", -1),
 		RepositoryURL: gjson.GetBytes(in, "repo_url").String(),
 		Branch:        gjson.GetBytes(in, "branch").String(),
 		User:          gjson.GetBytes(in, "user").String(),
 		Password:      gjson.GetBytes(in, "password").String(),
 		TenantID:      gjson.GetBytes(in, "tenant_id").String(),
+		ServiceID:     gjson.GetBytes(in, "service_id").String(),
 	}
 	envs := gjson.GetBytes(in, "envs").String()
 	be := make(map[string]string)
@@ -104,8 +116,8 @@ func NewSouceCodeBuildItem(in []byte) *SourceCodeBuildItem {
 		CodeSouceInfo: csi,
 		Lang:          gjson.GetBytes(in, "lang").String(),
 		Runtime:       gjson.GetBytes(in, "runtime").String(),
+		Configs:       gjson.GetBytes(in, "configs").Map(),
 		BuildEnvs:     be,
-		commit:        &object.Commit{},
 	}
 	scb.CacheDir = fmt.Sprintf("/cache/build/%s/cache/%s", scb.TenantID, scb.ServiceID)
 	//scb.SourceDir = scb.CodeSouceInfo.GetCodeSourceDir()
@@ -115,12 +127,11 @@ func NewSouceCodeBuildItem(in []byte) *SourceCodeBuildItem {
 
 //Run Run
 func (i *SourceCodeBuildItem) Run(timeout time.Duration) error {
-	//TODO:
 	// 1.clone
 	// 2.check dockerfile/ source_code
 	// 3.build
 	// 4.upload image /upload slug
-	rbi, err := sources.CreateRepostoryBuildInfo(i.CodeSouceInfo.RepositoryURL, i.CodeSouceInfo.Branch, i.TenantID)
+	rbi, err := sources.CreateRepostoryBuildInfo(i.CodeSouceInfo.RepositoryURL, i.CodeSouceInfo.ServerType, i.CodeSouceInfo.Branch, i.TenantID, i.ServiceID)
 	if err != nil {
 		i.Logger.Error("Git项目仓库地址格式错误", map[string]string{"step": "parse"})
 		return err
@@ -132,46 +143,156 @@ func (i *SourceCodeBuildItem) Run(timeout time.Duration) error {
 		return err
 	}
 	i.CodeSouceInfo.RepositoryURL = rbi.RepostoryURL
-	rs, err := sources.GitCloneOrPull(i.CodeSouceInfo, rbi.GetCodeHome(), i.Logger, 5)
-	if err != nil {
-		logrus.Errorf("pull git code error: %s", err.Error())
-		i.Logger.Error(fmt.Sprintf("拉取代码失败，请确保代码可以被正常下载"), map[string]string{"step": "builder-exector", "status": "failure"})
-		return err
+	switch i.CodeSouceInfo.ServerType {
+	case "svn":
+		csi := i.CodeSouceInfo
+		svnclient := sources.NewClient(csi, rbi.GetCodeHome(), i.Logger)
+		rs, err := svnclient.UpdateOrCheckout(rbi.BuildPath)
+		if err != nil {
+			logrus.Errorf("checkout svn code error: %s", err.Error())
+			i.Logger.Error(fmt.Sprintf("Checkout svn code failed, please make sure the code can be downloaded properly"), map[string]string{"step": "builder-exector", "status": "failure"})
+			return err
+		}
+		if rs.Logs == nil || len(rs.Logs.CommitEntrys) < 1 {
+			logrus.Errorf("get code commit info error: %s", err.Error())
+			i.Logger.Error(fmt.Sprintf("读取代码版本信息失败"), map[string]string{"step": "builder-exector", "status": "failure"})
+			return err
+		}
+		i.commit = Commit{
+			Hash:    rs.Logs.CommitEntrys[0].Revision,
+			Message: rs.Logs.CommitEntrys[0].Msg,
+			Author:  rs.Logs.CommitEntrys[0].Author,
+		}
+	default:
+		//default git
+		rs, err := sources.GitCloneOrPull(i.CodeSouceInfo, rbi.GetCodeHome(), i.Logger, 5)
+		if err != nil {
+			logrus.Errorf("pull git code error: %s", err.Error())
+			i.Logger.Error(fmt.Sprintf("拉取代码失败，请确保代码可以被正常下载"), map[string]string{"step": "builder-exector", "status": "failure"})
+			return err
+		}
+		//get last commit
+		commit, err := sources.GetLastCommit(rs)
+		if err != nil || commit == nil {
+			logrus.Errorf("get code commit info error: %s", err.Error())
+			i.Logger.Error(fmt.Sprintf("读取代码版本信息失败"), map[string]string{"step": "builder-exector", "status": "failure"})
+			return err
+		}
+		i.commit = Commit{
+			Hash:    commit.Hash.String(),
+			Author:  commit.Author.Name,
+			Message: commit.Message,
+		}
 	}
-	//get last commit
-	commit, err := sources.GetLastCommit(rs)
-	if err != nil || commit == nil {
-		logrus.Errorf("get code commit info error: %s", err.Error())
-		i.Logger.Error(fmt.Sprintf("读取代码版本信息失败"), map[string]string{"step": "builder-exector", "status": "failure"})
-		return err
-	}
-	i.commit = commit
-	info := fmt.Sprintf("版本:%s 上传者:%s Commit:%s ", commit.Hash.String()[0:7], commit.Author.Name, commit.Message)
-	i.Logger.Info(info, map[string]string{"step": "code-version"})
+	// clean cache code
+	defer func() {
+		if err := os.RemoveAll(rbi.GetCodeHome()); err != nil {
+			logrus.Warningf("remove source code: %v", err)
+		}
+	}()
 
-	if i.Lang == string(code.Dockerfile) || i.Lang == string(code.Docker) {
-		i.Logger.Info("代码识别出Dockerfile,直接构建镜像。", map[string]string{"step": "builder-exector"})
-		if err := i.buildImage(); err != nil {
-			logrus.Errorf("build from dockerfile error: %s", err.Error())
-			i.Logger.Error("基于Dockerfile构建应用发生错误，请分析日志查找原因", map[string]string{"step": "builder-exector", "status": "failure"})
-			return err
-		}
-	} else {
-		i.Logger.Info("开始代码构建", map[string]string{"step": "builder-exector"})
-		if err := i.buildCode(); err != nil {
-			logrus.Errorf("build from source code error: %s", err.Error())
-			i.Logger.Error("编译代码包过程遇到异常", map[string]string{"step": "builder-exector", "status": "failure"})
-			return err
-		}
+	hash := i.commit.Hash
+	if len(hash) >= 8 {
+		hash = i.commit.Hash[0:7]
 	}
-	i.Logger.Info("应用同步完成，开始启动应用", map[string]string{"step": "build-exector"})
-	if err := apiHandler.UpgradeService(i.TenantName, i.ServiceAlias, i.CreateUpgradeTaskBody()); err != nil {
-		i.Logger.Error("启动应用任务发送失败，请手动启动", map[string]string{"step": "builder-exector", "status": "failure"})
-		logrus.Errorf("rolling update service error, %s", err.Error())
+	info := fmt.Sprintf("CodeVersion:%s Author:%s Commit:%s ", hash, i.commit.Author, i.commit.Message)
+	i.Logger.Info(info, map[string]string{"step": "code-version"})
+	if _, ok := i.BuildEnvs["REPARSE"]; ok {
+		_, lang, err := parser.ReadRbdConfigAndLang(rbi)
+		if err != nil {
+			logrus.Errorf("reparse code lange error %s", err.Error())
+			i.Logger.Error(fmt.Sprintf("重新解析代码语言错误"), map[string]string{"step": "builder-exector", "status": "failure"})
+			return err
+		}
+		i.Lang = string(lang)
+	}
+
+	i.Logger.Info("pull or clone code successfully, start code build", map[string]string{"step": "codee-version"})
+	res, err := i.codeBuild()
+	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			i.Logger.Error("Build app version from source code timeout, the maximum time is 60 minutes", map[string]string{"step": "builder-exector", "status": "failure"})
+		} else {
+			i.Logger.Error("Build app version from source code failure,"+err.Error(), map[string]string{"step": "builder-exector", "status": "failure"})
+		}
 		return err
 	}
-	i.Logger.Info("应用启动任务发送成功", map[string]string{"step": "build-exector"})
+	if err := i.UpdateBuildVersionInfo(res); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (i *SourceCodeBuildItem) codeBuild() (*build.Response, error) {
+	codeBuild, err := build.GetBuild(code.Lang(i.Lang))
+	if err != nil {
+		logrus.Errorf("get code build error: %s lang %s", err.Error(), i.Lang)
+		i.Logger.Error(util.Translation("No way of compiling to support this source type was found"), map[string]string{"step": "builder-exector", "status": "failure"})
+		return nil, err
+	}
+	hostAlias, err := i.getHostAlias()
+	if err != nil {
+		i.Logger.Error(util.Translation("get rbd-repo ip failure"), map[string]string{"step": "builder-exector", "status": "failure"})
+		return nil, err
+	}
+	buildReq := &build.Request{
+		RbdNamespace:  i.RbdNamespace,
+		SourceDir:     i.RepoInfo.GetCodeBuildAbsPath(),
+		CacheDir:      i.CacheDir,
+		TGZDir:        i.TGZDir,
+		RepositoryURL: i.RepoInfo.RepostoryURL,
+		ServiceAlias:  i.ServiceAlias,
+		ServiceID:     i.ServiceID,
+		TenantID:      i.TenantID,
+		ServerType:    i.CodeSouceInfo.ServerType,
+		Runtime:       i.Runtime,
+		Branch:        i.CodeSouceInfo.Branch,
+		DeployVersion: i.DeployVersion,
+		Commit:        build.Commit{User: i.commit.Author, Message: i.commit.Message, Hash: i.commit.Hash},
+		Lang:          code.Lang(i.Lang),
+		BuildEnvs:     i.BuildEnvs,
+		Logger:        i.Logger,
+		DockerClient:  i.DockerClient,
+		KubeClient:    i.KubeClient,
+		HostAlias:     hostAlias,
+		Ctx:           i.Ctx,
+		GRDataPVCName: i.GRDataPVCName,
+		CachePVCName:  i.CachePVCName,
+		CacheMode:     i.CacheMode,
+		CachePath:     i.CachePath,
+	}
+	res, err := codeBuild.Build(buildReq)
+	return res, err
+}
+
+func (i *SourceCodeBuildItem) getExtraHosts() (extraHosts []string, err error) {
+	endpoints, err := i.KubeClient.CoreV1().Endpoints(i.RbdNamespace).Get(i.RbdRepoName, metav1.GetOptions{})
+	if err != nil {
+		logrus.Errorf("do not found ep by name: %s in namespace: %s", i.RbdRepoName, i.Namespace)
+		return nil, err
+	}
+	for _, subset := range endpoints.Subsets {
+		for _, addr := range subset.Addresses {
+			extraHosts = append(extraHosts, fmt.Sprintf("maven.goodrain.me:%s", addr.IP))
+			extraHosts = append(extraHosts, fmt.Sprintf("lang.goodrain.me:%s", addr.IP))
+		}
+	}
+	return
+}
+
+func (i *SourceCodeBuildItem) getHostAlias() (hostAliasList []build.HostAlias, err error) {
+	endpoints, err := i.KubeClient.CoreV1().Endpoints(i.RbdNamespace).Get(i.RbdRepoName, metav1.GetOptions{})
+	if err != nil {
+		logrus.Errorf("do not found ep by name: %s in namespace: %s", i.RbdRepoName, i.Namespace)
+		return nil, err
+	}
+	hostNames := []string{"maven.goodrain.me", "lang.goodrain.me"}
+	for _, subset := range endpoints.Subsets {
+		for _, addr := range subset.Addresses {
+			hostAliasList = append(hostAliasList, build.HostAlias{IP: addr.IP, Hostnames: hostNames})
+		}
+	}
+	return
 }
 
 //IsDockerfile CheckDockerfile
@@ -184,87 +305,6 @@ func (i *SourceCodeBuildItem) IsDockerfile() bool {
 	return true
 }
 
-func (i *SourceCodeBuildItem) buildImage() error {
-	filepath := path.Join(i.RepoInfo.GetCodeBuildAbsPath(), "Dockerfile")
-	i.Logger.Info("开始解析Dockerfile", map[string]string{"step": "builder-exector"})
-	_, err := sources.ParseFile(filepath)
-	if err != nil {
-		logrus.Error("parse dockerfile error.", err.Error())
-		i.Logger.Error(fmt.Sprintf("预解析Dockerfile失败"), map[string]string{"step": "builder-exector"})
-		return err
-	}
-	reg := regexp.MustCompile(`.*(?:\:|\/)([\w\-\.]+)/([\w\-\.]+)\.git`)
-	rc := reg.FindSubmatch([]byte(i.CodeSouceInfo.RepositoryURL))
-	var name string
-	if len(rc) == 3 {
-		name = fmt.Sprintf("%s_%s_%s", i.ServiceAlias, string(rc[1]), string(rc[2]))
-	} else {
-		name = fmt.Sprintf("%s_%s", i.ServiceAlias, "dockerfilebuild")
-	}
-	tag := i.DeployVersion
-	buildImageName := strings.ToLower(fmt.Sprintf("%s/%s:%s", REGISTRYDOMAIN, name, tag))
-	buildOptions := types.ImageBuildOptions{
-		Tags:   []string{buildImageName},
-		Remove: true,
-	}
-	if _, ok := i.BuildEnvs["NO_CACHE"]; ok {
-		buildOptions.NoCache = true
-	} else {
-		buildOptions.NoCache = false
-	}
-	i.Logger.Info("开始构建镜像", map[string]string{"step": "builder-exector"})
-	err = sources.ImageBuild(i.DockerClient, i.RepoInfo.GetCodeBuildAbsPath(), buildOptions, i.Logger, 5)
-	if err != nil {
-		i.Logger.Error(fmt.Sprintf("构造镜像%s失败", buildImageName), map[string]string{"step": "builder-exector", "status": "failure"})
-		logrus.Errorf("build image error: %s", err.Error())
-		return err
-	}
-	// check image exist
-	_, err = sources.ImageInspectWithRaw(i.DockerClient, buildImageName)
-	if err != nil {
-		i.Logger.Error(fmt.Sprintf("构造镜像%s失败,请查看Debug日志", buildImageName), map[string]string{"step": "builder-exector", "status": "failure"})
-		logrus.Errorf("get image inspect error: %s", err.Error())
-		return err
-	}
-	i.Logger.Info("镜像构建成功，开始推送镜像至仓库", map[string]string{"step": "builder-exector"})
-	err = sources.ImagePush(i.DockerClient, buildImageName, "", "", i.Logger, 5)
-	if err != nil {
-		i.Logger.Error("推送镜像失败", map[string]string{"step": "builder-exector"})
-		logrus.Errorf("push image error: %s", err.Error())
-		return err
-	}
-	i.Logger.Info("镜像推送镜像至仓库成功", map[string]string{"step": "builder-exector"})
-	//更新应用的镜像名称
-	service, err := db.GetManager().TenantServiceDao().GetServiceByID(i.ServiceID)
-	if err != nil {
-		i.Logger.Error("更新应用镜像信息失败", map[string]string{"step": "builder-exector"})
-		logrus.Errorf("get service from db error: %s", err.Error())
-		return err
-	}
-	service.ImageName = buildImageName
-	err = db.GetManager().TenantServiceDao().UpdateModel(service)
-	if err != nil {
-		i.Logger.Error("更新应用镜像信息失败", map[string]string{"step": "builder-exector"})
-		logrus.Errorf("update service from db error: %s", err.Error())
-		return err
-	}
-	vi := &dbmodel.VersionInfo{
-		DeliveredType: "image",
-		DeliveredPath: buildImageName,
-		EventID:       i.EventID,
-		FinalStatus:   "success",
-		CodeVersion:   i.commit.Hash.String(),
-		CommitMsg:     i.commit.Message,
-		Author:        i.commit.Author.Name,
-	}
-	logrus.Debugf("update app version commit info %s, author %s", i.commit.Message, i.commit.Author.Name)
-	if err := i.UpdateVersionInfo(vi); err != nil {
-		logrus.Errorf("update version info error: %s", err.Error())
-		i.Logger.Error("更新应用版本信息失败", map[string]string{"step": "builder-exector", "status": "failure"})
-		return err
-	}
-	return nil
-}
 func (i *SourceCodeBuildItem) prepare() error {
 	if err := util.CheckAndCreateDir(i.CacheDir); err != nil {
 		return err
@@ -275,7 +315,7 @@ func (i *SourceCodeBuildItem) prepare() error {
 	if err := util.CheckAndCreateDir(i.RepoInfo.GetCodeHome()); err != nil {
 		return err
 	}
-	if i.BuildEnvs["NO_CACHE"] == "true" {
+	if _, ok := i.BuildEnvs["NO_CACHE"]; ok {
 		if !util.DirIsEmpty(i.RepoInfo.GetCodeHome()) {
 			os.RemoveAll(i.RepoInfo.GetCodeHome())
 		}
@@ -291,90 +331,7 @@ func (i *SourceCodeBuildItem) prepare() error {
 	return nil
 }
 
-func (i *SourceCodeBuildItem) buildCode() error {
-	i.Logger.Info("开始编译代码包", map[string]string{"step": "build-exector"})
-	packageName := fmt.Sprintf("%s/%s.tgz", i.TGZDir, i.DeployVersion)
-	logfile := fmt.Sprintf("/grdata/build/tenant/%s/slug/%s/%s.log",
-		i.TenantID, i.ServiceID, i.DeployVersion)
-	buildName := func(s, buildVersion string) string {
-		mm := []byte(s)
-		return string(mm[:8]) + "_" + buildVersion
-	}(i.ServiceID, i.DeployVersion)
-	cmd := []string{"build.pl",
-		"-b", i.CodeSouceInfo.Branch,
-		"-s", i.RepoInfo.GetCodeBuildAbsPath(),
-		"-c", i.CacheDir,
-		"-d", i.TGZDir,
-		"-v", i.DeployVersion,
-		"-l", logfile,
-		"-tid", i.TenantID,
-		"-sid", i.ServiceID,
-		"-r", i.Runtime,
-		"-g", i.Lang,
-		"--name", buildName}
-	if len(i.BuildEnvs) != 0 {
-		buildEnvStr := ""
-		mm := []string{}
-		for k, v := range i.BuildEnvs {
-			mm = append(mm, k+"="+v)
-		}
-		if len(mm) > 1 {
-			buildEnvStr = strings.Join(mm, ":::")
-		} else {
-			buildEnvStr = mm[0]
-		}
-		cmd = append(cmd, "-e")
-		cmd = append(cmd, buildEnvStr)
-	}
-
-	if err := ShowExec("perl", cmd, i.Logger); err != nil {
-		i.Logger.Error("编译代码包失败", map[string]string{"step": "build-code", "status": "failure"})
-		logrus.Error("build perl error,", err.Error())
-		return err
-	}
-	i.Logger.Info("编译代码包完成。", map[string]string{"step": "build-code", "status": "success"})
-	fileInfo, err := os.Stat(packageName)
-	if err != nil {
-		i.Logger.Error("构建代码包检测失败", map[string]string{"step": "build-code", "status": "failure"})
-		logrus.Error("build package check error", err.Error())
-		return err
-	}
-	if fileInfo.Size() == 0 {
-		i.Logger.Error(fmt.Sprintf("构建失败！ 构建包大小为0 name：%s", packageName),
-			map[string]string{"step": "build-code", "status": "failure"})
-		return fmt.Errorf("build package size is 0")
-	}
-	i.Logger.Info("代码构建完成", map[string]string{"step": "build-code", "status": "success"})
-	vi := &dbmodel.VersionInfo{
-		DeliveredType: "slug",
-		DeliveredPath: packageName,
-		EventID:       i.EventID,
-		FinalStatus:   "success",
-		CodeVersion:   i.commit.Hash.String(),
-		CommitMsg:     i.commit.Message,
-		Author:        i.commit.Author.Name,
-	}
-	if err := i.UpdateVersionInfo(vi); err != nil {
-		logrus.Errorf("update version info error: %s", err.Error())
-		i.Logger.Error("更新应用版本信息失败", map[string]string{"step": "build-code", "status": "failure"})
-		return err
-	}
-	return nil
-}
-
-//CreateUpgradeTaskBody 构造消息体
-func (i *SourceCodeBuildItem) CreateUpgradeTaskBody() *model.RollingUpgradeTaskBody {
-	return &model.RollingUpgradeTaskBody{
-		TenantID:  i.TenantID,
-		ServiceID: i.ServiceID,
-		//TODO: 区分curr version 与 new version
-		CurrentDeployVersion: i.DeployVersion,
-		NewDeployVersion:     i.DeployVersion,
-		EventID:              i.EventID,
-	}
-}
-
-//UpdateVersionInfo 更新任务执行结果
+//UpdateVersionInfo Update build application service version info
 func (i *SourceCodeBuildItem) UpdateVersionInfo(vi *dbmodel.VersionInfo) error {
 	version, err := db.GetManager().VersionInfoDao().GetVersionByDeployVersion(i.DeployVersion, i.ServiceID)
 	if err != nil {
@@ -395,8 +352,30 @@ func (i *SourceCodeBuildItem) UpdateVersionInfo(vi *dbmodel.VersionInfo) error {
 	version.CommitMsg = vi.CommitMsg
 	version.Author = vi.Author
 	version.CodeVersion = vi.CodeVersion
-	logrus.Debugf("update app version %+v", *version)
+	version.CodeBranch = vi.CodeBranch
 	if err := db.GetManager().VersionInfoDao().UpdateModel(version); err != nil {
+		return err
+	}
+	return nil
+}
+
+//UpdateBuildVersionInfo update service build version info to db
+func (i *SourceCodeBuildItem) UpdateBuildVersionInfo(res *build.Response) error {
+	vi := &dbmodel.VersionInfo{
+		DeliveredType: string(res.MediumType),
+		DeliveredPath: res.MediumPath,
+		EventID:       i.EventID,
+		ImageName:     builder.RUNNERIMAGENAME,
+		FinalStatus:   "success",
+		CodeBranch:    i.CodeSouceInfo.Branch,
+		CodeVersion:   i.commit.Hash,
+		CommitMsg:     i.commit.Message,
+		Author:        i.commit.Author,
+		FinishTime:    time.Now(),
+	}
+	if err := i.UpdateVersionInfo(vi); err != nil {
+		logrus.Errorf("update version info error: %s", err.Error())
+		i.Logger.Error("Update application service version information failed", map[string]string{"step": "build-code", "status": "failure"})
 		return err
 	}
 	return nil

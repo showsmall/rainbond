@@ -32,7 +32,7 @@ import (
 func TestStoreETCD(t *testing.T) {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{"127.0.0.1:2379"},
-		DialTimeout: 5 * time.Second,
+		DialTimeout: 10 * time.Second,
 	})
 	if err != nil {
 		t.Error(err)
@@ -41,10 +41,10 @@ func TestStoreETCD(t *testing.T) {
 		etcdCli: cli,
 	}
 	rules := &api_model.NetDownStreamRules{
-		Limit:  1024,
-		Header: "E1:V1,E2:V2",
-		Domain: "test.redis.com",
-		Prefix: "/redis",
+		Limit: 1024,
+		//Header: "E1:V1,E2:V2",
+		//Domain: "test.redis.com",
+		//Prefix: "/redis",
 	}
 
 	srs := &api_model.SetNetDownStreamRuleStruct{

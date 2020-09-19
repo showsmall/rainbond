@@ -25,12 +25,13 @@ import (
 	"time"
 
 	"github.com/goodrain/rainbond/cmd/mq/option"
+	"github.com/goodrain/rainbond/mq/client"
 
 	"golang.org/x/net/context"
 
 	etcdutil "github.com/goodrain/rainbond/util/etcd"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
 )
 
@@ -42,7 +43,14 @@ type ActionMQ interface {
 	GetAllTopics() []string
 	Start() error
 	Stop() error
+	MessageQueueSize(topic string) int64
 }
+
+// EnqueueNumber enqueue number
+var EnqueueNumber float64 = 0
+
+// DequeueNumber dequeue number
+var DequeueNumber float64 = 0
 
 //NewActionMQ new etcd mq
 func NewActionMQ(ctx context.Context, c option.Config) ActionMQ {
@@ -64,10 +72,14 @@ type etcdQueue struct {
 
 func (e *etcdQueue) Start() error {
 	logrus.Debug("etcd message queue client starting")
-	cli, err := clientv3.New(clientv3.Config{
+	etcdClientArgs := &etcdutil.ClientArgs{
 		Endpoints:   e.config.EtcdEndPoints,
+		CaFile:      e.config.EtcdCaFile,
+		CertFile:    e.config.EtcdCertFile,
+		KeyFile:     e.config.EtcdKeyFile,
 		DialTimeout: time.Duration(e.config.EtcdTimeout) * time.Second,
-	})
+	}
+	cli, err := etcdutil.NewClient(context.Background(), etcdClientArgs)
 	if err != nil {
 		etcdutil.HandleEtcdError(err)
 		return err
@@ -80,8 +92,9 @@ func (e *etcdQueue) Start() error {
 			e.registerTopic(t)
 		}
 	}
-	e.registerTopic("worker")
-	e.registerTopic("builder")
+	e.registerTopic(client.BuilderTopic)
+	e.registerTopic(client.WindowsBuilderTopic)
+	e.registerTopic(client.WorkerTopic)
 	logrus.Info("etcd message queue client started success")
 	return nil
 }
@@ -117,11 +130,26 @@ func (e *etcdQueue) queueKey(topic string) string {
 	return e.config.EtcdPrefix + "/" + topic
 }
 func (e *etcdQueue) Enqueue(ctx context.Context, topic, value string) error {
-	queue := etcdutil.NewQueue(e.client, e.queueKey(topic), ctx)
+	EnqueueNumber++
+	queue := etcdutil.NewQueue(ctx, e.client, e.queueKey(topic))
 	return queue.Enqueue(value)
 }
 
 func (e *etcdQueue) Dequeue(ctx context.Context, topic string) (string, error) {
-	queue := etcdutil.NewQueue(e.client, e.queueKey(topic), ctx)
+	DequeueNumber++
+	queue := etcdutil.NewQueue(ctx, e.client, e.queueKey(topic))
 	return queue.Dequeue()
+}
+
+func (e *etcdQueue) MessageQueueSize(topic string) int64 {
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	res, err := e.client.Get(ctx, e.queueKey(topic), clientv3.WithPrefix())
+	if err != nil {
+		logrus.Errorf("get message queue size failure %s", err.Error())
+	}
+	if res != nil {
+		return res.Count
+	}
+	return 0
 }

@@ -22,9 +22,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	//"github.com/docker/docker/client"
-	"github.com/docker/engine-api/client"
+	"github.com/docker/docker/client"
 )
 
 var dockerrun = `docker run -d -P -v /usr/share/ca-certificates/:/etc/ssl/certs -p 4001:4001 -p 2380:2380 -p 2379:2379 \
@@ -43,7 +43,7 @@ func TestParse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := CreateDockerRunOrImageParse(dockerrun, dockerclient, nil)
+	p := CreateDockerRunOrImageParse("", "", dockerrun, dockerclient, nil)
 	if err := p.Parse(); err != nil {
 		logrus.Errorf(err.Error())
 	}

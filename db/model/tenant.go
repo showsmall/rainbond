@@ -23,15 +23,12 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/distribution/reference"
 )
 
 //Model 默认字段
 type Model struct {
 	ID        uint      `gorm:"column:ID;primary_key"`
-	CreatedAt time.Time `gorm:"column:create_time"`
+	CreatedAt time.Time `gorm:"column:create_time" json:"create_time"`
 }
 
 //IDModel 默认ID字段
@@ -44,12 +41,30 @@ type Interface interface {
 	TableName() string
 }
 
+// TenantStatus -
+type TenantStatus string
+
+var (
+	// TenantStatusNormal -
+	TenantStatusNormal TenantStatus = "normal"
+	// TenantStatusDeleting -
+	TenantStatusDeleting TenantStatus = "deleting"
+	// TenantStatusDeleteFailed -
+	TenantStatusDeleteFailed TenantStatus = "delete_failed"
+)
+
+func (t TenantStatus) String() string {
+	return string(t)
+}
+
 //Tenants 租户信息
 type Tenants struct {
 	Model
-	Name string `gorm:"column:name;size:40;unique_index"`
-	UUID string `gorm:"column:uuid;size:33;unique_index"`
-	EID  string `gorm:"column:eid"`
+	Name        string `gorm:"column:name;size:40;unique_index"`
+	UUID        string `gorm:"column:uuid;size:33;unique_index"`
+	EID         string `gorm:"column:eid"`
+	LimitMemory int    `gorm:"column:limit_memory"`
+	Status      string `gorm:"column:status;default:'normal'"`
 }
 
 //TableName 返回租户表名称
@@ -57,7 +72,79 @@ func (t *Tenants) TableName() string {
 	return "tenants"
 }
 
-//TenantServices 租户应用
+// ServiceKind kind of service
+type ServiceKind string
+
+// ServiceKindThirdParty means third-party service
+var ServiceKindThirdParty ServiceKind = "third_party"
+
+// ServiceKindInternal means internal service
+var ServiceKindInternal ServiceKind = "internal"
+
+func (s ServiceKind) String() string {
+	return string(s)
+}
+
+// ServiceType type of service
+type ServiceType string
+
+// String imple String
+func (s ServiceType) String() string {
+	return string(s)
+}
+
+// IsState is state type or not
+func (s ServiceType) IsState() bool {
+	if s == ServiceTypeStateMultiple || s == ServiceTypeStateSingleton {
+		return true
+	}
+	return false
+}
+
+// IsSingleton is singleton or not
+func (s ServiceType) IsSingleton() bool {
+	if s == "" {
+		return false
+	}
+	if s == ServiceTypeStatelessMultiple || s == ServiceTypeStateMultiple {
+		return false
+	}
+	return true
+}
+
+// TODO fanyangyang 根据组件简单判断是否是有状态
+// IsState is state service or stateless service
+func (ts *TenantServices) IsState() bool {
+	if ts.ExtendMethod == "" {
+		return false
+	}
+	return ServiceType(ts.ExtendMethod).IsState()
+}
+
+// IsSingleton is singleton or multiple service
+func (ts *TenantServices) IsSingleton() bool {
+	if ts.ExtendMethod == "" {
+		return false
+	}
+	return ServiceType(ts.ExtendMethod).IsSingleton()
+}
+
+// ServiceTypeUnknown unknown
+var ServiceTypeUnknown ServiceType = "unknown"
+
+//ServiceTypeStatelessSingleton stateless_singleton
+var ServiceTypeStatelessSingleton ServiceType = "stateless_singleton"
+
+// ServiceTypeStatelessMultiple stateless_multiple
+var ServiceTypeStatelessMultiple ServiceType = "stateless_multiple"
+
+// ServiceTypeStateSingleton state_singleton
+var ServiceTypeStateSingleton ServiceType = "state_singleton"
+
+// ServiceTypeStateMultiple state_multiple
+var ServiceTypeStateMultiple ServiceType = "state_multiple"
+
+//TenantServices app service base info
 type TenantServices struct {
 	Model
 	TenantID  string `gorm:"column:tenant_id;size:32" json:"tenant_id"`
@@ -66,27 +153,20 @@ type TenantServices struct {
 	ServiceKey string `gorm:"column:service_key;size:32" json:"service_key"`
 	// 服务别名
 	ServiceAlias string `gorm:"column:service_alias;size:30" json:"service_alias"`
+	// service regist endpoint name(host name), used of statefulset
+	ServiceName string `gorm:"column:service_name;size:100" json:"service_name"`
+	// （This field is not currently used, use ExtendMethod）Service type now service support
+	ServiceType string `gorm:"column:service_type;size:32" json:"service_type"`
 	// 服务描述
 	Comment string `gorm:"column:comment" json:"comment"`
-	// 服务版本
-	ServiceVersion string `gorm:"column:service_version;size:32" json:"service_version"`
-	// 镜像名称
-	ImageName string `gorm:"column:image_name;size:100" json:"image_name"`
 	// 容器CPU权重
 	ContainerCPU int `gorm:"column:container_cpu;default:500" json:"container_cpu"`
 	// 容器最大内存
 	ContainerMemory int `gorm:"column:container_memory;default:128" json:"container_memory"`
-	// 容器启动命令
-	ContainerCMD string `gorm:"column:container_cmd;size:2048" json:"container_cmd"`
-	// 容器环境变量
-	ContainerEnv string `gorm:"column:container_env;size:255" json:"container_env"`
-	// 卷名字
-	VolumePath string `gorm:"column:volume_path" json:"volume_path"`
-	// 容器挂载目录
-	VolumeMountPath string `gorm:"column:volume_mount_path" json:"volume_mount_path"`
-	// 宿主机目录
-	HostPath string `gorm:"column:host_path" json:"host_path"`
-	// 扩容方式；0:无状态；1:有状态；2:分区
+	//UpgradeMethod service upgrade controller type
+	//such as : `Rolling` `OnDelete`
+	UpgradeMethod string `gorm:"column:upgrade_method;default:'Rolling'" json:"upgrade_method"`
+	// 组件类型  component deploy type stateless_singleton/stateless_multiple/state_singleton/state_multiple
 	ExtendMethod string `gorm:"column:extend_method;default:'stateless';" json:"extend_method"`
 	// 节点数
 	Replicas int `gorm:"column:replicas;default:1" json:"replicas"`
@@ -94,47 +174,20 @@ type TenantServices struct {
 	DeployVersion string `gorm:"column:deploy_version" json:"deploy_version"`
 	// 服务分类：application,cache,store
 	Category string `gorm:"column:category" json:"category"`
-	// 服务当前状态：undeploy,running,closed,unusual,starting,checking,stoping
+	// 服务当前状态：undeploy,running,closed,unusual,starting,checking,stoping(deprecated)
 	CurStatus string `gorm:"column:cur_status;default:'undeploy'" json:"cur_status"`
-	// 计费状态 为1 计费，为0不计费
+	// 计费状态 为1 计费，为0不计费 (deprecated)
 	Status int `gorm:"column:status;default:0" json:"status"`
 	// 最新操作ID
 	EventID string `gorm:"column:event_id" json:"event_id"`
-	// 服务类型
-	ServiceType string `gorm:"column:service_type" json:"service_type"`
-	// 镜像来源
+	// 租户ID
 	Namespace string `gorm:"column:namespace" json:"namespace"`
-	// 共享类型shared、exclusive
-	VolumeType string `gorm:"column:volume_type;default:'shared'" json:"volume_type"`
-	// 端口类型，one_outer;dif_protocol;multi_outer
-	PortType string `gorm:"column:port_type;default:'multi_outer'" json:"port_type"`
 	// 更新时间
 	UpdateTime time.Time `gorm:"column:update_time" json:"update_time"`
 	// 服务创建类型cloud云市服务,assistant云帮服务
 	ServiceOrigin string `gorm:"column:service_origin;default:'assistant'" json:"service_origin"`
-	// 代码来源:gitlab,github
-	CodeFrom string `gorm:"column:code_from" json:"code_from"`
-
-	Domain string `gorm:"column:domain" json:"domain"`
-}
-
-//IsSlug 是否是slug应用
-func (t *TenantServices) IsSlug() bool {
-	return strings.HasPrefix(t.ImageName, "goodrain.me/runner")
-}
-
-//CreateShareImage 生成镜像分享的地址
-func (t *TenantServices) CreateShareImage(hubURL, namespace, version string) (string, error) {
-	_, err := reference.ParseAnyReference(t.ImageName)
-	if err != nil {
-		logrus.Errorf("reference image error: %s", err.Error())
-		return "", err
-	}
-	image := ParseImage(t.ImageName)
-	image.Host = hubURL
-	image.Namespace = namespace
-	image.Name = image.Name + "_" + version
-	return image.String(), nil
+	// kind of service. option: internal, third_party
+	Kind string `gorm:"column:kind;default:'internal'" json:"kind"`
 }
 
 //Image 镜像
@@ -145,6 +198,9 @@ type Image struct {
 }
 
 func (i Image) String() string {
+	if i.Namespace == "" {
+		return fmt.Sprintf("%s/%s", i.Host, i.Name)
+	}
 	return fmt.Sprintf("%s/%s/%s", i.Host, i.Namespace, i.Name)
 }
 
@@ -173,6 +229,7 @@ func (t *TenantServices) CreateShareSlug(servicekey, namespace, version string) 
 //ChangeDelete ChangeDelete
 func (t *TenantServices) ChangeDelete() *TenantServicesDelete {
 	delete := TenantServicesDelete(*t)
+	delete.UpdateTime = time.Now()
 	return &delete
 }
 
@@ -202,26 +259,19 @@ type TenantServicesDelete struct {
 	ServiceKey string `gorm:"column:service_key;size:32" json:"service_key"`
 	// 服务别名
 	ServiceAlias string `gorm:"column:service_alias;size:30" json:"service_alias"`
+	// service regist endpoint name(host name), used of statefulset
+	ServiceName string `gorm:"column:service_name;size:100" json:"service_name"`
+	// Service type now service support stateless_singleton/stateless_multiple/state_singleton/state_multiple
+	ServiceType string `gorm:"column:service_type;size:20" json:"service_type"`
 	// 服务描述
 	Comment string `gorm:"column:comment" json:"comment"`
-	// 服务版本
-	ServiceVersion string `gorm:"column:service_version;size:32" json:"service_version"`
-	// 镜像名称
-	ImageName string `gorm:"column:image_name;size:100" json:"image_name"`
 	// 容器CPU权重
 	ContainerCPU int `gorm:"column:container_cpu;default:500" json:"container_cpu"`
 	// 容器最大内存
 	ContainerMemory int `gorm:"column:container_memory;default:128" json:"container_memory"`
-	// 容器启动命令
-	ContainerCMD string `gorm:"column:container_cmd;size:2048" json:"container_cmd"`
-	// 容器环境变量
-	ContainerEnv string `gorm:"column:container_env;size:255" json:"container_env"`
-	// 卷名字
-	VolumePath string `gorm:"column:volume_path" json:"volume_path"`
-	// 容器挂载目录
-	VolumeMountPath string `gorm:"column:volume_mount_path" json:"volume_mount_path"`
-	// 宿主机目录
-	HostPath string `gorm:"column:host_path" json:"host_path"`
+	//UpgradeMethod service upgrade controller type
+	//such as : `Rolling` `OnDelete`
+	UpgradeMethod string `gorm:"column:upgrade_method;default:'Rolling'" json:"upgrade_method"`
 	// 扩容方式；0:无状态；1:有状态；2:分区
 	ExtendMethod string `gorm:"column:extend_method;default:'stateless';" json:"extend_method"`
 	// 节点数
@@ -230,28 +280,20 @@ type TenantServicesDelete struct {
 	DeployVersion string `gorm:"column:deploy_version" json:"deploy_version"`
 	// 服务分类：application,cache,store
 	Category string `gorm:"column:category" json:"category"`
-	// 服务当前状态：undeploy,running,closed,unusual,starting,checking,stoping
+	// 服务当前状态：undeploy,running,closed,unusual,starting,checking,stoping(deprecated)
 	CurStatus string `gorm:"column:cur_status;default:'undeploy'" json:"cur_status"`
-	// 计费状态 为1 计费，为0不计费
+	// 计费状态 为1 计费，为0不计费 (deprecated)
 	Status int `gorm:"column:status;default:0" json:"status"`
 	// 最新操作ID
 	EventID string `gorm:"column:event_id" json:"event_id"`
-	// 服务类型
-	ServiceType string `gorm:"column:service_type" json:"service_type"`
-	// 镜像来源
+	// 租户ID
 	Namespace string `gorm:"column:namespace" json:"namespace"`
-	// 共享类型shared、exclusive
-	VolumeType string `gorm:"column:volume_type;default:'shared'" json:"volume_type"`
-	// 端口类型，one_outer;dif_protocol;multi_outer
-	PortType string `gorm:"column:port_type;default:'multi_outer'" json:"port_type"`
 	// 更新时间
 	UpdateTime time.Time `gorm:"column:update_time" json:"update_time"`
 	// 服务创建类型cloud云市服务,assistant云帮服务
 	ServiceOrigin string `gorm:"column:service_origin;default:'assistant'" json:"service_origin"`
-	// 代码来源:gitlab,github
-	CodeFrom string `gorm:"column:code_from" json:"code_from"`
-
-	Domain string `gorm:"column:domain" json:"domain"`
+	// kind of service. option: internal, third_party
+	Kind string `gorm:"column:kind;default:'internal'" json:"kind"`
 }
 
 //TableName 表名
@@ -266,10 +308,10 @@ type TenantServicesPort struct {
 	ServiceID      string `gorm:"column:service_id;size:32" validate:"service_id|between:30,33" json:"service_id"`
 	ContainerPort  int    `gorm:"column:container_port" validate:"container_port|required|numeric_between:1,65535" json:"container_port"`
 	MappingPort    int    `gorm:"column:mapping_port" validate:"mapping_port|required|numeric_between:1,65535" json:"mapping_port"`
-	Protocol       string `gorm:"column:protocol" validate:"protocol|required|in:http,https,stream,grpc" json:"protocol"`
+	Protocol       string `gorm:"column:protocol" validate:"protocol|required|in:http,https,tcp,grpc,udp,mysql" json:"protocol"`
 	PortAlias      string `gorm:"column:port_alias" validate:"port_alias|required|alpha_dash" json:"port_alias"`
-	IsInnerService bool   `gorm:"column:is_inner_service" validate:"is_inner_service|bool" json:"is_inner_service"`
-	IsOuterService bool   `gorm:"column:is_outer_service" validate:"is_outer_service|bool" json:"is_outer_service"`
+	IsInnerService *bool  `gorm:"column:is_inner_service" validate:"is_inner_service|bool" json:"is_inner_service"`
+	IsOuterService *bool  `gorm:"column:is_outer_service" validate:"is_outer_service|bool" json:"is_outer_service"`
 }
 
 //TableName 表名
@@ -306,7 +348,7 @@ type TenantServiceRelation struct {
 
 //TableName 表名
 func (t *TenantServiceRelation) TableName() string {
-	return "tenant_service_relation"
+	return "tenant_services_relation"
 }
 
 //TenantServiceEnvVar  应用环境变量
@@ -317,7 +359,7 @@ type TenantServiceEnvVar struct {
 	ContainerPort int    `gorm:"column:container_port" validate:"container_port|numeric_between:1,65535" json:"container_port"`
 	Name          string `gorm:"column:name;size:100" validate:"name" json:"name"`
 	AttrName      string `gorm:"column:attr_name" validate:"env_name|required" json:"attr_name"`
-	AttrValue     string `gorm:"column:attr_value" validate:"env_value|required" json:"attr_value"`
+	AttrValue     string `gorm:"column:attr_value;size:1024" validate:"env_value|required" json:"attr_value"`
 	IsChange      bool   `gorm:"column:is_change" validate:"is_change|bool" json:"is_change"`
 	Scope         string `gorm:"column:scope;default:'outer'" validate:"scope|in:outer,inner,both" json:"scope"`
 }
@@ -325,7 +367,7 @@ type TenantServiceEnvVar struct {
 //TableName 表名
 func (t *TenantServiceEnvVar) TableName() string {
 	//TODO:表名修改
-	return "tenant_service_evn_var"
+	return "tenant_services_envs"
 }
 
 //TenantServiceMountRelation 应用挂载依赖纪录
@@ -340,11 +382,12 @@ type TenantServiceMountRelation struct {
 	HostPath string `gorm:"column:mnt_dir" json:"host_path" validate:"host_path"`
 	//存储名称(依赖应用的共享存储对应的名称)
 	VolumeName string `gorm:"column:volume_name;size:40" json:"volume_name" validate:"volume_name|required"`
+	VolumeType string `gorm:"column:volume_type" json:"volume_type" validate:"volume_type|required"`
 }
 
 //TableName 表名
 func (t *TenantServiceMountRelation) TableName() string {
-	return "tenant_service_mnt_relation"
+	return "tenant_services_mnt_relation"
 }
 
 //VolumeType 存储类型
@@ -359,6 +402,20 @@ var LocalVolumeType VolumeType = "local"
 //MemoryFSVolumeType 内存文件存储
 var MemoryFSVolumeType VolumeType = "memoryfs"
 
+//ConfigFileVolumeType configuration file volume type
+var ConfigFileVolumeType VolumeType = "config-file"
+
+// CephRBDVolumeType ceph rbd volume type
+var CephRBDVolumeType VolumeType = "ceph-rbd"
+
+// AliCloudVolumeType alicloud volume type
+var AliCloudVolumeType VolumeType = "alicloud-disk"
+
+// MakeNewVolume make volumeType
+func MakeNewVolume(name string) VolumeType {
+	return VolumeType(name)
+}
+
 func (vt VolumeType) String() string {
 	return string(vt)
 }
@@ -370,7 +427,7 @@ type TenantServiceVolume struct {
 	//服务类型
 	Category string `gorm:"column:category;size:50" json:"category"`
 	//存储类型（share,local,tmpfs）
-	VolumeType string `gorm:"column:volume_type;size:20" json:"volume_type"`
+	VolumeType string `gorm:"column:volume_type;size:64" json:"volume_type"`
 	//存储名称
 	VolumeName string `gorm:"column:volume_name;size:40" json:"volume_name"`
 	//主机地址
@@ -379,11 +436,38 @@ type TenantServiceVolume struct {
 	VolumePath string `gorm:"column:volume_path" json:"volume_path"`
 	//是否只读
 	IsReadOnly bool `gorm:"column:is_read_only;default:false" json:"is_read_only"`
+	// VolumeCapacity 存储大小
+	VolumeCapacity int64 `gorm:"column:volume_capacity" json:"volume_capacity"`
+	// AccessMode 读写模式（Important! A volume can only be mounted using one access mode at a time, even if it supports many. For example, a GCEPersistentDisk can be mounted as ReadWriteOnce by a single node or ReadOnlyMany by many nodes, but not at the same time. #https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes）
+	AccessMode string `gorm:"column:access_mode" json:"access_mode"`
+	// SharePolicy 共享模式
+	SharePolicy string `gorm:"column:share_policy" json:"share_policy"`
+	// BackupPolicy 备份策略
+	BackupPolicy string `gorm:"column:backup_policy" json:"backup_policy"`
+	// ReclaimPolicy 回收策略
+	ReclaimPolicy string `json:"reclaim_policy"`
+	// AllowExpansion 是否支持扩展
+	AllowExpansion bool `gorm:"column:allow_expansion" json:"allow_expansion"`
+	// VolumeProviderName 使用的存储驱动别名
+	VolumeProviderName string `gorm:"collumn:volume_provider_name" json:"volume_provider_name"`
 }
 
 //TableName 表名
 func (t *TenantServiceVolume) TableName() string {
-	return "tenant_service_volume"
+	return "tenant_services_volume"
+}
+
+// TenantServiceConfigFile represents a data in configMap which is one of the types of volumes
+type TenantServiceConfigFile struct {
+	Model
+	ServiceID   string `gorm:"column:service_id;size:32" json:"service_id"`
+	VolumeName  string `gorm:"column:volume_name;size:32" json:"volume_name"`
+	FileContent string `gorm:"column:file_content;size:65535" json:"filename"`
+}
+
+// TableName returns table name of TenantServiceConfigFile.
+func (t *TenantServiceConfigFile) TableName() string {
+	return "tenant_service_config_file"
 }
 
 //TenantServiceLable 应用高级标签
@@ -396,20 +480,7 @@ type TenantServiceLable struct {
 
 //TableName 表名
 func (t *TenantServiceLable) TableName() string {
-	return "tenant_service_label"
-}
-
-//TenantServiceStatus 应用实时状态
-type TenantServiceStatus struct {
-	Model
-	ServiceID string `gorm:"column:service_id;size:32;unique_index"`
-	Status    string `gorm:"column:status;size:24"`
-	//undeploy 1, closed 2, stopping 3, starting 4, running 5
-}
-
-//TableName 表名
-func (t *TenantServiceStatus) TableName() string {
-	return "tenant_service_status"
+	return "tenant_services_label"
 }
 
 //LabelKeyNodeSelector 节点选择标签
@@ -418,9 +489,7 @@ var LabelKeyNodeSelector = "node-selector"
 //LabelKeyNodeAffinity 节点亲和标签
 var LabelKeyNodeAffinity = "node-affinity"
 
-//LabelKeyNodeAntyAffinity 节点反亲和标签
-var LabelKeyNodeAntyAffinity = "node-anti-affinity"
-
+// TODO fanyangyang 待删除，组件类型记录在tenant_service表中
 //LabelKeyServiceType 应用部署类型标签
 var LabelKeyServiceType = "service-type"
 
@@ -429,3 +498,104 @@ var LabelKeyServiceAffinity = "service-affinity"
 
 //LabelKeyServiceAntyAffinity 应用反亲和标签
 var LabelKeyServiceAntyAffinity = "service-anti-affinity"
+
+// LabelKeyServicePrivileged -
+var LabelKeyServicePrivileged = "privileged"
+
+//TenantServiceProbe 应用探针信息
+type TenantServiceProbe struct {
+	Model
+	ServiceID string `gorm:"column:service_id;size:32" json:"service_id" validate:"service_id|between:30,33"`
+	ProbeID   string `gorm:"column:probe_id;size:32" json:"probe_id" validate:"probe_id|between:30,33"`
+	Mode      string `gorm:"column:mode;default:'liveness'" json:"mode" validate:"mode"`
+	Scheme    string `gorm:"column:scheme;default:'scheme'" json:"scheme" validate:"scheme"`
+	Path      string `gorm:"column:path" json:"path" validate:"path"`
+	Port      int    `gorm:"column:port;size:5;default:80" json:"port" validate:"port|required|numeric_between:1,65535"`
+	Cmd       string `gorm:"column:cmd;size:150" json:"cmd" validate:"cmd"`
+	//http请求头，key=value,key2=value2
+	HTTPHeader string `gorm:"column:http_header;size:300" json:"http_header" validate:"http_header"`
+	//初始化等候时间
+	InitialDelaySecond int `gorm:"column:initial_delay_second;size:2;default:4" json:"initial_delay_second" validate:"initial_delay_second"`
+	//检测间隔时间
+	PeriodSecond int `gorm:"column:period_second;size:2;default:3" json:"period_second" validate:"period_second"`
+	//检测超时时间
+	TimeoutSecond int `gorm:"column:timeout_second;size:3;default:5" json:"timeout_second" validate:"timeout_second"`
+	//是否启用
+	IsUsed *int `gorm:"column:is_used;size:1;default:1" json:"is_used" validate:"is_used"`
+	//标志为失败的检测次数
+	FailureThreshold int `gorm:"column:failure_threshold;size:2;default:3" json:"failure_threshold" validate:"failure_threshold"`
+	//标志为成功的检测次数
+	SuccessThreshold int    `gorm:"column:success_threshold;size:2;default:1" json:"success_threshold" validate:"success_threshold"`
+	FailureAction    string `gorm:"column:failure_action;" json:"failure_action" validate:"failure_action"`
+}
+
+// FailureActionType  type of failure action.
+type FailureActionType string
+
+func (fat FailureActionType) String() string {
+	return string(fat)
+}
+
+const (
+	// IgnoreFailureAction do nothing when the probe result is a failure
+	IgnoreFailureAction FailureActionType = "ignore"
+	// OfflineFailureAction offline the probe object when the probe result is a failure
+	OfflineFailureAction FailureActionType = "readiness"
+	// RestartFailureAction restart the probe object when the probe result is a failure
+	RestartFailureAction FailureActionType = "liveness"
+)
+
+//TableName 表名
+func (t *TenantServiceProbe) TableName() string {
+	return "tenant_services_probe"
+}
+
+// TenantServiceAutoscalerRules -
+type TenantServiceAutoscalerRules struct {
+	Model
+	RuleID      string `gorm:"column:rule_id;unique;size:32"`
+	ServiceID   string `gorm:"column:service_id;size:32"`
+	Enable      bool   `gorm:"column:enable"`
+	XPAType     string `gorm:"column:xpa_type;size:3"`
+	MinReplicas int    `gorm:"colume:min_replicas"`
+	MaxReplicas int    `gorm:"colume:max_replicas"`
+}
+
+// TableName -
+func (t *TenantServiceAutoscalerRules) TableName() string {
+	return "tenant_services_autoscaler_rules"
+}
+
+// TenantServiceAutoscalerRuleMetrics -
+type TenantServiceAutoscalerRuleMetrics struct {
+	Model
+	RuleID            string `gorm:"column:rule_id;size:32;not null"`
+	MetricsType       string `gorm:"column:metric_type;not null"`
+	MetricsName       string `gorm:"column:metric_name;not null"`
+	MetricTargetType  string `gorm:"column:metric_target_type;not null"`
+	MetricTargetValue int    `gorm:"column:metric_target_value;not null"`
+}
+
+// TableName -
+func (t *TenantServiceAutoscalerRuleMetrics) TableName() string {
+	return "tenant_services_autoscaler_rule_metrics"
+}
+
+// TenantServiceScalingRecords -
+type TenantServiceScalingRecords struct {
+	Model
+	ServiceID   string    `gorm:"column:service_id" json:"-"`
+	RuleID      string    `gorm:"column:rule_id" json:"rule_id"`
+	EventName   string    `gorm:"column:event_name;not null" json:"record_id"`
+	RecordType  string    `gorm:"column:record_type" json:"record_type"`
+	Reason      string    `gorm:"column:reason" json:"reason"`
+	Count       int32     `gorm:"column:count" json:"count"`
+	Description string    `gorm:"column:description;size:1023" json:"description"`
+	Operator    string    `gorm:"column:operator" json:"operator"`
+	LastTime    time.Time `gorm:"column:last_time" json:"last_time"`
+}
+
+// TableName -
+func (t *TenantServiceScalingRecords) TableName() string {
+	return "tenant_services_scaling_records"
+}

@@ -19,15 +19,16 @@
 package callback
 
 import (
-	"github.com/Sirupsen/logrus"
+	"time"
+
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/discover"
 	"github.com/goodrain/rainbond/discover/config"
 	"github.com/goodrain/rainbond/monitor/prometheus"
+	"github.com/goodrain/rainbond/monitor/utils"
 	"github.com/goodrain/rainbond/util/watch"
 	"github.com/prometheus/common/model"
 	"github.com/tidwall/gjson"
-	"time"
-	"github.com/goodrain/rainbond/monitor/utils"
 )
 
 // App 指app运行时信息，来源于所有子节点上的node
@@ -40,6 +41,7 @@ type App struct {
 	endpoints []*config.Endpoint
 }
 
+//UpdateEndpoints update endpoint
 func (e *App) UpdateEndpoints(endpoints ...*config.Endpoint) {
 	newArr := utils.TrimAndSort(endpoints)
 
@@ -58,6 +60,7 @@ func (e *App) Error(err error) {
 	logrus.Error(err)
 }
 
+//Name name
 func (e *App) Name() string {
 	return "app"
 }
@@ -86,35 +89,47 @@ func (e *App) toScrape() *prometheus.ScrapeConfig {
 	}
 }
 
+//AddEndpoint add endpoint
 func (e *App) AddEndpoint(end *config.Endpoint) {
 	e.endpoints = append(e.endpoints, end)
 	e.UpdateEndpoints(e.endpoints...)
 }
 
+//Add add
 func (e *App) Add(event *watch.Event) {
-	url := gjson.Get(event.GetValueString(), "external_ip").String() + ":6100"
+	url := gjson.Get(event.GetValueString(), "internal_ip").String() + ":6100"
 	end := &config.Endpoint{
-		URL: url,
+		URL:  url,
+		Name: event.GetKey(),
 	}
-
 	e.AddEndpoint(end)
 }
 
+//Modify Modify
 func (e *App) Modify(event *watch.Event) {
+	var update bool
+	url := gjson.Get(event.GetValueString(), "internal_ip").String() + ":6100"
 	for i, end := range e.endpoints {
-		if end.URL == event.GetValueString() {
-			url := gjson.Get(event.GetValueString(), "external_ip").String() + ":6100"
+		if end.Name == event.GetKey() {
 			e.endpoints[i].URL = url
 			e.UpdateEndpoints(e.endpoints...)
+			update = true
 			break
 		}
 	}
+	if !update {
+		e.endpoints = append(e.endpoints, &config.Endpoint{
+			Name: event.GetKey(),
+			URL:  url,
+		})
+		e.UpdateEndpoints(e.endpoints...)
+	}
 }
 
+//Delete Delete
 func (e *App) Delete(event *watch.Event) {
 	for i, end := range e.endpoints {
-		url := gjson.Get(event.GetValueString(), "external_ip").String() + ":6100"
-		if end.URL == url {
+		if end.Name == event.GetKey() {
 			e.endpoints = append(e.endpoints[:i], e.endpoints[i+1:]...)
 			e.UpdateEndpoints(e.endpoints...)
 			break

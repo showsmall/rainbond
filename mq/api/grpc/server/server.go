@@ -21,10 +21,12 @@ package server
 import (
 	"fmt"
 
+	"github.com/goodrain/rainbond/util"
+
 	"github.com/goodrain/rainbond/mq/api/grpc/pb"
 	"github.com/goodrain/rainbond/mq/api/mq"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	context "golang.org/x/net/context"
 
@@ -40,6 +42,9 @@ func (s *mqServer) Enqueue(ctx context.Context, in *pb.EnqueueRequest) (*pb.Task
 	if in.Topic == "" || !s.actionMQ.TopicIsExist(in.Topic) {
 		return nil, fmt.Errorf("topic %s is not support", in.Topic)
 	}
+	if in.Message.TaskId == "" {
+		in.Message.TaskId = util.NewUUID()
+	}
 	message, err := proto.Marshal(in.Message)
 	if err != nil {
 		return nil, err
@@ -50,7 +55,7 @@ func (s *mqServer) Enqueue(ctx context.Context, in *pb.EnqueueRequest) (*pb.Task
 	if err != nil {
 		return nil, err
 	}
-	logrus.Debugf("task (%v) enqueue.", in.Message.String())
+	logrus.Debugf("task (%v) enqueue.", in.Message.TaskType)
 	return &pb.TaskReply{
 		Status: "success",
 	}, nil
@@ -77,7 +82,7 @@ func (s *mqServer) Dequeue(ctx context.Context, in *pb.DequeueRequest) (*pb.Task
 	if err != nil {
 		return nil, err
 	}
-	logrus.Infof("task (%s) dnqueue by (%s).", task.GetTaskType(), in.ClientHost)
+	logrus.Debugf("task (%s) dnqueue by (%s).", task.GetTaskType(), in.ClientHost)
 	return &task, nil
 }
 

@@ -20,74 +20,86 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/go-chi/chi"
-	"github.com/goodrain/rainbond/node/utils"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/version"
-	"github.com/prometheus/node_exporter/collector"
-
 	"github.com/goodrain/rainbond/node/api/model"
-
-	"errors"
-	"io/ioutil"
-	"strconv"
-
-	"github.com/goodrain/rainbond/node/core/k8s"
+	"github.com/goodrain/rainbond/node/nodem/client"
+	"github.com/goodrain/rainbond/node/utils"
 	httputil "github.com/goodrain/rainbond/util/http"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/version"
 )
 
 func init() {
 	prometheus.MustRegister(version.NewCollector("node_exporter"))
 }
 
-//NewNode 创建一个节点
-func NewNode(w http.ResponseWriter, r *http.Request) {
-	var node model.APIHostNode
+//InstallNode install a node
+func InstallNode(w http.ResponseWriter, r *http.Request) {
+	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	node, err := nodeService.GetNode(nodeUID)
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	if err := nodeService.InstallNode(node); err != nil {
+		err.Handle(r, w)
+		return
+	}
+	httputil.ReturnSuccess(r, w, node)
+}
+
+//AddNode add a node
+func AddNode(w http.ResponseWriter, r *http.Request) {
+	isInstall := r.FormValue("is_install")
+	var node client.APIHostNode
 	if ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &node, nil); !ok {
 		return
 	}
-	if node.Role == nil || len(node.Role) == 0 {
-		err := utils.CreateAPIHandleError(400, fmt.Errorf("node role must not null"))
+	rnode, err := nodeService.AddNode(&node)
+	if err != nil {
 		err.Handle(r, w)
 		return
 	}
-	if err := nodeService.AddNode(&node); err != nil {
-		err.Handle(r, w)
-		return
-	}
-	httputil.ReturnSuccess(r, w, nil)
-}
-
-//NewMultipleNode 多节点添加操作
-func NewMultipleNode(w http.ResponseWriter, r *http.Request) {
-	var nodes []model.APIHostNode
-	if ok := httputil.ValidatorRequestStructAndErrorResponse(r, w, &nodes, nil); !ok {
-		return
-	}
-	var successnodes []model.APIHostNode
-	for _, node := range nodes {
-		if err := nodeService.AddNode(&node); err != nil {
-			continue
+	if isInstall == "true" || node.AutoInstall {
+		if err := nodeService.InstallNode(rnode); err != nil {
+			err.Handle(r, w)
+			return
 		}
-		successnodes = append(successnodes, node)
 	}
-	httputil.ReturnSuccess(r, w, successnodes)
+	httputil.ReturnSuccess(r, w, rnode)
 }
 
 //GetNodes 获取全部节点
 func GetNodes(w http.ResponseWriter, r *http.Request) {
+	searchNodeList := make([]client.HostNode, 0)
+	searchKey := r.FormValue("search_key")
 	nodes, err := nodeService.GetAllNode()
 	if err != nil {
 		err.Handle(r, w)
 		return
 	}
-	httputil.ReturnSuccess(r, w, nodes)
+	for _, node := range nodes {
+		var nodevalue = *node
+		//list value need simplify
+		nodevalue.NodeStatus.Conditions = nil
+		nodevalue.NodeStatus.KubeNode = nil
+		if searchKey != "" {
+			if strings.Contains(node.HostName, searchKey) || strings.Contains(node.InternalIP, searchKey) || strings.Contains(node.ExternalIP, searchKey) {
+				searchNodeList = append(searchNodeList, nodevalue)
+			}
+		} else {
+			searchNodeList = append(searchNodeList, nodevalue)
+		}
+	}
+	httputil.ReturnSuccess(r, w, searchNodeList)
 }
 
 //GetNode 获取一个节点详情
@@ -98,13 +110,30 @@ func GetNode(w http.ResponseWriter, r *http.Request) {
 		err.Handle(r, w)
 		return
 	}
+	node.DeleteCondition("OutOfDisk", "MemoryPressure", "DiskPressure", "PIDPressure")
 	httputil.ReturnSuccess(r, w, node)
+}
+
+func getKubeletMessage(v *client.HostNode) string {
+
+	for _, condiction := range v.NodeStatus.Conditions {
+		if condiction.Type == "kubelet" {
+			return condiction.Message
+		}
+	}
+	return ""
 }
 
 //GetRuleNodes 获取分角色节点
 func GetRuleNodes(w http.ResponseWriter, r *http.Request) {
 	rule := chi.URLParam(r, "rule")
-	if rule != "compute" && rule != "manage" && rule != "storage" {
+	allowRule := map[string]struct{}{
+		"compute": struct{}{},
+		"manage":  struct{}{},
+		"storage": struct{}{},
+		"gateway": struct{}{},
+	}
+	if _, ok := allowRule[rule]; !ok {
 		httputil.ReturnError(r, w, 400, rule+" rule is not define")
 		return
 	}
@@ -113,7 +142,7 @@ func GetRuleNodes(w http.ResponseWriter, r *http.Request) {
 		err.Handle(r, w)
 		return
 	}
-	var masternodes []*model.HostNode
+	var masternodes []*client.HostNode
 	for _, node := range nodes {
 		if node.Role.HasRule(rule) {
 			masternodes = append(masternodes, node)
@@ -122,44 +151,13 @@ func GetRuleNodes(w http.ResponseWriter, r *http.Request) {
 	httputil.ReturnSuccess(r, w, masternodes)
 }
 
-func Install(w http.ResponseWriter, r *http.Request) {
-	nodeID := strings.TrimSpace(chi.URLParam(r, "node_id"))
-	if len(nodeID) == 0 {
-		err := utils.APIHandleError{
-			Code: 404,
-			Err:  errors.New(fmt.Sprintf("can't find node by node_id %s", nodeID)),
-		}
-		err.Handle(r, w)
-		return
-	}
-	nodeService.InstallNode(nodeID)
-
-	httputil.ReturnSuccess(r, w, nil)
-}
-
-func InitStatus(w http.ResponseWriter, r *http.Request) {
-	nodeIP := strings.TrimSpace(chi.URLParam(r, "node_ip"))
-	if len(nodeIP) == 0 {
-		err := utils.APIHandleError{
-			Code: 404,
-			Err:  errors.New(fmt.Sprintf("can't find node by node_ip %s", nodeIP)),
-		}
-		err.Handle(r, w)
-		return
-	}
-	status, err := nodeService.InitStatus(nodeIP)
-	if err != nil {
-		err.Handle(r, w)
-		return
-	}
-	httputil.ReturnSuccess(r, w, status)
-}
+//Resource -
 func Resource(w http.ResponseWriter, r *http.Request) {
 	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
 	if len(nodeUID) == 0 {
 		err := utils.APIHandleError{
 			Code: 404,
-			Err:  errors.New(fmt.Sprintf("can't find node by node_id %s", nodeUID)),
+			Err:  fmt.Errorf("can't find node by node_id %s", nodeUID),
 		}
 		err.Handle(r, w)
 		return
@@ -172,13 +170,13 @@ func Resource(w http.ResponseWriter, r *http.Request) {
 	httputil.ReturnSuccess(r, w, res)
 }
 
-//UpNode 节点上线，计算节点操作
+//CheckNode -
 func CheckNode(w http.ResponseWriter, r *http.Request) {
 	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
 	if len(nodeUID) == 0 {
 		err := utils.APIHandleError{
 			Code: 404,
-			Err:  errors.New(fmt.Sprintf("can't find node by node_id %s", nodeUID)),
+			Err:  fmt.Errorf("can't find node by node_id %s", nodeUID),
 		}
 		err.Handle(r, w)
 		return
@@ -220,7 +218,7 @@ func DeleteRainbondNode(w http.ResponseWriter, r *http.Request) {
 		err.Handle(r, w)
 		return
 	}
-	httputil.ReturnSuccess(r, w, nil)
+	httputil.ReturnSuccess(r, w, "delete success")
 }
 
 //Cordon 不可调度
@@ -257,17 +255,113 @@ func PutLabel(w http.ResponseWriter, r *http.Request) {
 		logrus.Errorf("error unmarshal labels  ,details %s", error.Error())
 		return
 	}
-	err := nodeService.PutNodeLabel(nodeUID, label)
+	labels, err := nodeService.PutNodeLabel(nodeUID, label)
 	if err != nil {
 		err.Handle(r, w)
 		return
 	}
-	httputil.ReturnSuccess(r, w, nil)
+	httputil.ReturnSuccess(r, w, labels)
+}
+
+//DeleteLabel delete node label
+func DeleteLabel(w http.ResponseWriter, r *http.Request) {
+	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	var label = make(map[string]string)
+	in, error := ioutil.ReadAll(r.Body)
+	if error != nil {
+		logrus.Errorf("error read from request ,details %s", error.Error())
+		return
+	}
+	error = json.Unmarshal(in, &label)
+	if error != nil {
+		logrus.Errorf("error unmarshal labels  ,details %s", error.Error())
+		return
+	}
+	labels, err := nodeService.DeleteNodeLabel(nodeUID, label)
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	httputil.ReturnSuccess(r, w, labels)
+}
+
+//GetLabel get node label
+func GetLabel(w http.ResponseWriter, r *http.Request) {
+	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	labels, err := nodeService.GetNodeLabels(nodeUID)
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	httputil.ReturnSuccess(r, w, labels)
+}
+
+//ListNodeCondition list node condition
+func ListNodeCondition(w http.ResponseWriter, r *http.Request) {
+	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	node, err := nodeService.GetNode(nodeUID)
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	httputil.ReturnSuccess(r, w, node.NodeStatus.Conditions)
+}
+
+//DeleteNodeCondition delete node condition
+func DeleteNodeCondition(w http.ResponseWriter, r *http.Request) {
+	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	conditionType := strings.TrimSpace(chi.URLParam(r, "condition"))
+	node, err := nodeService.GetNode(nodeUID)
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	for _, condition := range node.NodeStatus.Conditions {
+		if string(condition.Type) == conditionType {
+			node, err := nodeService.DeleteNodeCondition(nodeUID, condition.Type)
+			if err != nil {
+				err.Handle(r, w)
+				return
+			}
+			httputil.ReturnSuccess(r, w, node.NodeStatus.Conditions)
+			return
+		}
+	}
+	httputil.ReturnError(r, w, 404, "condition not exist")
 }
 
 //DownNode 节点下线，计算节点操作
 func DownNode(w http.ResponseWriter, r *http.Request) {
 	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	n, err := nodeService.GetNode(nodeUID)
+	if err != nil {
+		err := utils.APIHandleError{
+			Code: 402,
+			Err:  errors.New(fmt.Sprint("Can not get node by nodeID")),
+		}
+		err.Handle(r, w)
+		return
+	}
+	if n.Role.HasRule("manage") {
+		nodes, _ := nodeService.GetAllNode()
+		if nodes != nil && len(nodes) > 0 {
+			count := 0
+			for _, node := range nodes {
+				if node.Role.HasRule("manage") {
+					count++
+				}
+			}
+			if count < 2 {
+				err := utils.APIHandleError{
+					Code: 403,
+					Err:  errors.New(fmt.Sprint("manage node less two, can not down it.")),
+				}
+				err.Handle(r, w)
+				return
+			}
+		}
+	}
+	logrus.Info("Node down by node api controller: ", nodeUID)
 	node, err := nodeService.DownNode(nodeUID)
 	if err != nil {
 		err.Handle(r, w)
@@ -279,6 +373,7 @@ func DownNode(w http.ResponseWriter, r *http.Request) {
 //UpNode 节点上线，计算节点操作
 func UpNode(w http.ResponseWriter, r *http.Request) {
 	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	logrus.Info("Node up by node api controller: ", nodeUID)
 	node, err := nodeService.UpNode(nodeUID)
 	if err != nil {
 		err.Handle(r, w)
@@ -287,7 +382,7 @@ func UpNode(w http.ResponseWriter, r *http.Request) {
 	httputil.ReturnSuccess(r, w, node)
 }
 
-//UpNode 节点实例，计算节点操作
+//Instances get node service instances
 func Instances(w http.ResponseWriter, r *http.Request) {
 	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
 	node, err := nodeService.GetNode(nodeUID)
@@ -295,7 +390,7 @@ func Instances(w http.ResponseWriter, r *http.Request) {
 		err.Handle(r, w)
 		return
 	}
-	ps, error := k8s.GetPodsByNodeName(nodeUID)
+	ps, error := kubecli.GetPodsByNodes(nodeUID)
 	if error != nil {
 		httputil.ReturnError(r, w, 404, error.Error())
 		return
@@ -306,8 +401,13 @@ func Instances(w http.ResponseWriter, r *http.Request) {
 	var cpuL int64
 	var memR int64
 	var memL int64
-	capCPU := node.NodeStatus.Capacity.Cpu().Value()
-	capMEM := node.NodeStatus.Capacity.Memory().Value()
+	capCPU := node.AvailableCPU
+	capMEM := node.AvailableMemory
+	k8snode, _ := kubecli.GetNode(nodeUID)
+	if k8snode != nil {
+		capCPU = k8snode.Status.Allocatable.Cpu().Value()
+		capMEM = k8snode.Status.Allocatable.Memory().Value()
+	}
 	for _, v := range ps {
 		pod := &model.Pods{}
 		pod.Namespace = v.Namespace
@@ -319,35 +419,33 @@ func Instances(w http.ResponseWriter, r *http.Request) {
 		pod.Id = serviceID
 
 		ConditionsStatuss := v.Status.Conditions
-		for _,val := range ConditionsStatuss{
-			if val.Type == "Ready"{
-				pod.Status = model.ConditionStatus(val.Status)
+		for _, val := range ConditionsStatuss {
+			if val.Type == "Ready" {
+				pod.Status = string(val.Status)
 			}
 		}
 
-
 		//lc := v.Spec.Containers[0].Resources.Limits.Cpu().MilliValue()
 		lc := v.Spec.Containers
-		for _,v:=range lc{
+		for _, v := range lc {
 			cpuL += v.Resources.Limits.Cpu().MilliValue()
 		}
 
 		//lm := v.Spec.Containers[0].Resources.Limits.Memory().Value()
 		lm := v.Spec.Containers
-		for _,v:=range lm{
+		for _, v := range lm {
 			memL += v.Resources.Limits.Memory().Value()
 		}
 
-
 		//rc := v.Spec.Containers[0].Resources.Requests.Cpu().MilliValue()
 		rc := v.Spec.Containers
-		for _,v:=range rc{
-			cpuR+=v.Resources.Requests.Cpu().MilliValue()
+		for _, v := range rc {
+			cpuR += v.Resources.Requests.Cpu().MilliValue()
 		}
 
 		//rm := v.Spec.Containers[0].Resources.Requests.Memory().Value()
 		rm := v.Spec.Containers
-		for _,v :=range rm{
+		for _, v := range rm {
 			memR += v.Resources.Requests.Memory().Value()
 		}
 
@@ -367,39 +465,6 @@ func Instances(w http.ResponseWriter, r *http.Request) {
 		pods = append(pods, pod)
 	}
 	httputil.ReturnSuccess(r, w, pods)
-}
-
-//NodeExporter 节点监控
-func NodeExporter(w http.ResponseWriter, r *http.Request) {
-	// filters := r.URL.Query()["collect[]"]
-	// logrus.Debugln("collect query:", filters)
-	filters := []string{"cpu", "diskstats", "filesystem", "ipvs", "loadavg", "meminfo", "netdev", "netstat", "uname", "mountstats", "nfs"}
-	nc, err := collector.NewNodeCollector(filters...)
-	if err != nil {
-		logrus.Warnln("Couldn't create", err)
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(fmt.Sprintf("Couldn't create %s", err)))
-		return
-	}
-	registry := prometheus.NewRegistry()
-	err = registry.Register(nc)
-	if err != nil {
-		logrus.Errorln("Couldn't register collector:", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(fmt.Sprintf("Couldn't register collector: %s", err)))
-		return
-	}
-	gatherers := prometheus.Gatherers{
-		prometheus.DefaultGatherer,
-		registry,
-	}
-	// Delegate http serving to Prometheus client library, which will call collector.Collect.
-	h := promhttp.HandlerFor(gatherers,
-		promhttp.HandlerOpts{
-			ErrorLog:      logrus.StandardLogger(),
-			ErrorHandling: promhttp.ContinueOnError,
-		})
-	h.ServeHTTP(w, r)
 }
 
 //临时存在
@@ -448,4 +513,64 @@ func outJSONWithCode(w http.ResponseWriter, httpCode int, data interface{}) {
 		w.WriteHeader(httpCode)
 	}
 	fmt.Fprint(w, s)
+}
+
+//GetAllNodeHealth get all node health
+func GetAllNodeHealth(w http.ResponseWriter, r *http.Request) {
+	nodes, err := nodeService.GetAllNode()
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	StatusMap := make(map[string][]map[string]string, 30)
+	roleList := make([]map[string]string, 0, 10)
+	for _, n := range nodes {
+		for _, v := range n.NodeStatus.Conditions {
+			status, ok := StatusMap[string(v.Type)]
+			if !ok {
+				StatusMap[string(v.Type)] = []map[string]string{
+					map[string]string{
+						"type":     string(v.Type),
+						"status":   string(v.Status),
+						"message":  string(v.Message),
+						"hostname": n.HostName,
+					},
+				}
+			} else {
+				list := status
+				list = append(list, map[string]string{
+					"type":     string(v.Type),
+					"status":   string(v.Status),
+					"message":  string(v.Message),
+					"hostname": n.HostName,
+				},
+				)
+				StatusMap[string(v.Type)] = list
+			}
+		}
+		roleList = append(roleList, map[string]string{"role": n.Role.String(), "status": n.NodeStatus.Status})
+	}
+	StatusMap["Role"] = roleList
+	httputil.ReturnSuccess(r, w, StatusMap)
+}
+
+//UpdateNodeStatus update node status
+//`{"status":"installing"}`
+func UpdateNodeStatus(w http.ResponseWriter, r *http.Request) {
+	var req = make(map[string]string)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httputil.ReturnError(r, w, 400, err.Error())
+		return
+	}
+	nodeUID := strings.TrimSpace(chi.URLParam(r, "node_id"))
+	if err := nodeService.UpdateNodeStatus(nodeUID, req["status"]); err != nil {
+		err.Handle(r, w)
+		return
+	}
+	node, err := nodeService.GetNode(nodeUID)
+	if err != nil {
+		err.Handle(r, w)
+		return
+	}
+	httputil.ReturnSuccess(r, w, node)
 }

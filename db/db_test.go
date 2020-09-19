@@ -19,13 +19,70 @@
 package db
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/testcontainers/testcontainers-go"
 
 	dbconfig "github.com/goodrain/rainbond/db/config"
 	"github.com/goodrain/rainbond/db/model"
 	"github.com/goodrain/rainbond/util"
 )
+
+func CreateTestManager() (Manager, error) {
+	dbname := "region"
+	rootpw := "rainbond"
+
+	ctx := context.Background()
+	req := testcontainers.ContainerRequest{
+		Image:        "mariadb",
+		ExposedPorts: []string{"3306/tcp"},
+		Env: map[string]string{
+			"MYSQL_ROOT_PASSWORD": rootpw,
+			"MYSQL_DATABASE":      dbname,
+		},
+		Cmd: "--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci",
+	}
+	mariadb, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer mariadb.Terminate(ctx)
+
+	host, err := mariadb.Host(ctx)
+	if err != nil {
+		return nil, err
+	}
+	port, err := mariadb.MappedPort(ctx, "3306")
+	if err != nil {
+		return nil, err
+	}
+
+	connInfo := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", "root",
+		rootpw, host, port.Int(), dbname)
+	tryTimes := 3
+	for {
+		if err := CreateManager(dbconfig.Config{
+			DBType:              "mysql",
+			MysqlConnectionInfo: connInfo,
+		}); err != nil {
+			if tryTimes == 0 {
+				return nil, fmt.Errorf("Connect info: %s; error creating db manager: %v", connInfo, err)
+			}
+			tryTimes = tryTimes - 1
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		break
+	}
+	return GetManager(), nil
+}
 
 func TestTenantDao(t *testing.T) {
 	if err := CreateManager(dbconfig.Config{
@@ -98,8 +155,8 @@ func TestSetServiceLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	label := model.TenantServiceLable{
-		LabelKey:   model.LabelKeyServiceType,
-		LabelValue: util.StatefulServiceType,
+		LabelKey:   "labelkey",
+		LabelValue: "labelvalue",
 		ServiceID:  "889bb1f028f655bebd545f24aa184a0b",
 	}
 	label.CreatedAt = time.Now()
@@ -196,33 +253,181 @@ func TestCockroachDBDeleteService(t *testing.T) {
 	}
 }
 
-func TestCockroachDBSaveDeployInfo(t *testing.T) {
+//func TestCockroachDBSaveDeployInfo(t *testing.T) {
+//	if err := CreateManager(dbconfig.Config{
+//		MysqlConnectionInfo: "postgresql://root@localhost:5432/region?sslmode=disable",
+//		DBType:              "cockroachdb",
+//	}); err != nil {
+//		t.Fatal(err)
+//	}
+//	err := GetManager().K8sDeployReplicationDao().AddModel(&model.K8sDeployReplication{
+//		TenantID:        "asdasd",
+//		ServiceID:       "asdasdasdasd",
+//		ReplicationID:   "asdasdadsasdasdasd",
+//		ReplicationType: model.TypeReplicationController,
+//	})
+//	if err != nil {
+//		t.Fatal(err)
+//	}
+//}
+
+//func TestCockroachDBDeleteDeployInfo(t *testing.T) {
+//	if err := CreateManager(dbconfig.Config{
+//		MysqlConnectionInfo: "postgresql://root@localhost:5432/region?sslmode=disable",
+//		DBType:              "cockroachdb",
+//	}); err != nil {
+//		t.Fatal(err)
+//	}
+//err := GetManager().K8sDeployReplicationDao().DeleteK8sDeployReplication("asdasdadsasdasdasd")
+//if err != nil {
+//	t.Fatal(err)
+//}
+//}
+
+func TestGetCertificateByID(t *testing.T) {
 	if err := CreateManager(dbconfig.Config{
-		MysqlConnectionInfo: "postgresql://root@localhost:5432/region?sslmode=disable",
-		DBType:              "cockroachdb",
+		MysqlConnectionInfo: "admin:admin@tcp(127.0.0.1:3306)/region",
+		DBType:              "mysql",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := GetManager().K8sDeployReplicationDao().AddModel(&model.K8sDeployReplication{
-		TenantID:        "asdasd",
-		ServiceID:       "asdasdasdasd",
-		ReplicationID:   "asdasdadsasdasdasd",
-		ReplicationType: model.TypeReplicationController,
-	})
+
+	cert, err := GetManager().TenantServiceLabelDao().GetTenantNodeAffinityLabel("105bb7d4b94774f922edb3051bdf8ce1")
 	if err != nil {
 		t.Fatal(err)
+	}
+	fmt.Println(cert)
+}
+
+var shareFileVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "share-file",
+	NameShow:    "共享存储（文件）",
+	Description: "分布式文件存储，可租户内共享挂载，适用于所有类型应用",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Retain",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO,ROX,RWX",
+}
+
+var localVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "local",
+	NameShow:    "本地存储",
+	Description: "本地存储设备，适用于有状态数据库服务",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Retain",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO,ROX,RWX",
+}
+
+var memoryFSVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "memoryfs",
+	NameShow:    "内存文件存储",
+	Description: "基于内存的存储设备，容量由内存量限制。应用重启数据即丢失，适用于高速暂存数据",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Retain",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO,ROX,RWX",
+}
+
+var alicloudDiskAvailableVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "alicloud-disk-available",
+	NameShow:    "阿里云盘（智能选择）",
+	Description: "阿里云智能选择云盘。会通过高效云盘、SSD、基础云盘的顺序依次尝试创建当前阿里云区域支持的云盘类型",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Delete",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO",
+	Sort:          10,
+}
+
+var alicloudDiskcommonVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "alicloud-disk-common",
+	NameShow:    "阿里云盘（基础）",
+	Description: "阿里云普通基础云盘。最小限额5G",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Delete",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO",
+	Sort:          13,
+}
+var alicloudDiskEfficiencyVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "alicloud-disk-efficiency",
+	NameShow:    "阿里云盘（高效）",
+	Description: "阿里云高效云盘。最小限额20G",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Delete",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO",
+	Sort:          11,
+}
+var alicloudDiskeSSDVolumeType = &model.TenantServiceVolumeType{
+	VolumeType:  "alicloud-disk-ssd",
+	NameShow:    "阿里云盘（SSD）",
+	Description: "阿里云SSD类型云盘。最小限额20G",
+	// CapacityValidation:   string(bs),
+	ReclaimPolicy: "Delete",
+	BackupPolicy:  "exclusive",
+	SharePolicy:   "exclusive",
+	AccessMode:    "RWO",
+	Sort:          12,
+}
+
+func TestVolumeType(t *testing.T) {
+
+	capacityValidation := make(map[string]interface{})
+	capacityValidation["required"] = true
+	capacityValidation["default"] = 20
+	capacityValidation["min"] = 20
+	capacityValidation["max"] = 32768 // [ali-cloud-disk usage limit](https://help.aliyun.com/document_detail/25412.html?spm=5176.2020520101.0.0.41d84df5faliP4)
+	bs, _ := json.Marshal(capacityValidation)
+	shareFileVolumeType.CapacityValidation = string(bs)
+	localVolumeType.CapacityValidation = string(bs)
+	memoryFSVolumeType.CapacityValidation = string(bs)
+	alicloudDiskeSSDVolumeType.CapacityValidation = string(bs)
+	if err := CreateManager(dbconfig.Config{
+		MysqlConnectionInfo: "ieZoo9:Maigoed0@tcp(192.168.2.108:3306)/region",
+		DBType:              "mysql",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetManager().VolumeTypeDao().AddModel(alicloudDiskeSSDVolumeType); err != nil {
+		t.Error(err)
+	} else {
+		t.Log("yes")
 	}
 }
 
-func TestCockroachDBDeleteDeployInfo(t *testing.T) {
+func initDBManager(t *testing.T) {
 	if err := CreateManager(dbconfig.Config{
-		MysqlConnectionInfo: "postgresql://root@localhost:5432/region?sslmode=disable",
-		DBType:              "cockroachdb",
+		MysqlConnectionInfo: "ieZoo9:Maigoed0@tcp(192.168.2.108:3306)/region",
+		DBType:              "mysql",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := GetManager().K8sDeployReplicationDao().DeleteK8sDeployReplication("asdasdadsasdasdasd")
+}
+func TestGetVolumeType(t *testing.T) {
+	initDBManager(t)
+	vts, err := GetManager().VolumeTypeDao().GetAllVolumeTypes()
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, vt := range vts {
+		t.Logf("%+v", vt)
+	}
+	t.Logf("volume type len is : %v", len(vts))
+}
+
+func TestGetVolumeTypeByType(t *testing.T) {
+	initDBManager(t)
+	vt, err := GetManager().VolumeTypeDao().GetVolumeTypeByType("ceph-rbd")
+	if err != nil {
+		t.Fatal("get volumeType by type error: ", err.Error())
+	}
+	t.Logf("%+v", vt)
 }

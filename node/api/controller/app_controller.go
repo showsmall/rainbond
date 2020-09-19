@@ -19,11 +19,12 @@
 package controller
 
 import (
-	httputil "github.com/goodrain/rainbond/util/http"
 	"net/http"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
+	httputil "github.com/goodrain/rainbond/util/http"
+
+	"github.com/sirupsen/logrus"
 	"github.com/go-chi/chi"
 )
 
@@ -44,7 +45,6 @@ func APPDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httputil.ReturnSuccess(r, w, endpoints)
-	//httputil.ReturnList(r, w, len(endpoints), 1, endpoints...)
 }
 
 //APPList 列出已注册应用

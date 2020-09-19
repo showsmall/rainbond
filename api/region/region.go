@@ -19,208 +19,161 @@
 package region
 
 import (
-	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"path"
+	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/bitly/go-simplejson"
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/api/model"
-	api_model "github.com/goodrain/rainbond/api/model"
 	"github.com/goodrain/rainbond/api/util"
-	dbmodel "github.com/goodrain/rainbond/db/model"
+	"github.com/goodrain/rainbond/cmd"
 	utilhttp "github.com/goodrain/rainbond/util/http"
-	"github.com/pquerna/ffjson/ffjson"
 )
 
 var regionAPI, token string
-var region *Region
 
-type Region struct {
-	regionAPI string
-	token     string
-	authType  string
-}
+var region Region
 
-func (r *Region) Tenants() TenantInterface {
-	return &tenant{prefix: "/tenants"}
-}
+//AllTenant AllTenant
+var AllTenant string
 
-type tenant struct {
-	tenantID string
-	prefix   string
-}
-type services struct {
-	tenant *tenant
-	prefix string
-	model  model.ServiceStruct
+//Region region api
+type Region interface {
+	Tenants(name string) TenantInterface
+	Resources() ResourcesInterface
+	Nodes() NodeInterface
+	Cluster() ClusterInterface
+	Configs() ConfigsInterface
+	Version() string
+	Monitor() MonitorInterface
+	Notification() NotificationInterface
+	DoRequest(path, method string, body io.Reader, decode *utilhttp.ResponseBody) (int, error)
 }
 
-//TenantInterface TenantInterface
-type TenantInterface interface {
-	Get(name string) *tenant
-	Services() ServiceInterface
-	DefineSources(ss *api_model.SourceSpec) DefineSourcesInterface
-	DefineCloudAuth(gt *api_model.GetUserToken) DefineCloudAuthInterface
+//APIConf region api config
+type APIConf struct {
+	Endpoints []string `yaml:"endpoints"`
+	Token     string   `yaml:"token"`
+	AuthType  string   `yaml:"auth_type"`
+	Cacert    string   `yaml:"client-ca-file"`
+	Cert      string   `yaml:"tls-cert-file"`
+	CertKey   string   `yaml:"tls-private-key-file"`
 }
 
-func (t *tenant) Get(name string) *tenant {
-	t.tenantID = name
-	return t
+type serviceInfo struct {
+	ServicesAlias string `json:"serviceAlias"`
+	TenantName    string `json:"tenantName"`
+	ServiceID     string `json:"serviceId"`
+	TenantID      string `json:"tenantId"`
 }
-func (t *tenant) Delete(name string) error {
-	return nil
+
+type podInfo struct {
+	ServiceID       string                       `json:"service_id"`
+	ReplicationID   string                       `json:"rc_id"`
+	ReplicationType string                       `json:"rc_type"`
+	PodName         string                       `json:"pod_name"`
+	PodIP           string                       `json:"pod_ip"`
+	Container       map[string]map[string]string `json:"container"`
 }
-func (t *tenant) Services() ServiceInterface {
-	return &services{
-		prefix: "services",
-		tenant: t,
+
+//NewRegion NewRegion
+func NewRegion(c APIConf) (Region, error) {
+	if region == nil {
+		re := &regionImpl{
+			APIConf: c,
+		}
+		if c.Cacert != "" && c.Cert != "" && c.CertKey != "" {
+			pool := x509.NewCertPool()
+			caCrt, err := ioutil.ReadFile(c.Cacert)
+			if err != nil {
+				logrus.Errorf("read ca file err: %s", err)
+				return nil, err
+			}
+			pool.AppendCertsFromPEM(caCrt)
+			cliCrt, err := tls.LoadX509KeyPair(c.Cert, c.CertKey)
+			if err != nil {
+				logrus.Errorf("Loadx509keypair err: %s", err)
+				return nil, err
+			}
+			tr := &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs:      pool,
+					Certificates: []tls.Certificate{cliCrt},
+				},
+			}
+			re.Client = &http.Client{
+				Transport: tr,
+				Timeout:   15 * time.Second,
+			}
+		} else {
+			re.Client = http.DefaultClient
+		}
+		region = re
 	}
+	return region, nil
 }
 
-//ServiceInterface ServiceInterface
-type ServiceInterface interface {
-	Get(name string) (map[string]string, *util.APIHandleError)
-	Pods(serviceAlisa string) ([]*dbmodel.K8sPod, *util.APIHandleError)
-	List() ([]*model.ServiceStruct, *util.APIHandleError)
-	Stop(serviceAlisa, eventID string) *util.APIHandleError
-	Start(serviceAlisa, eventID string) *util.APIHandleError
-	EventLog(serviceAlisa, eventID, level string) ([]*model.MessageData, *util.APIHandleError)
+//GetRegion GetRegion
+func GetRegion() Region {
+	return region
 }
 
-func (s *services) Pods(serviceAlisa string) ([]*dbmodel.K8sPod, *util.APIHandleError) {
-	body, code, err := request("/v2"+s.tenant.prefix+"/"+s.tenant.tenantID+"/"+s.prefix+"/"+serviceAlisa+"/pods", "GET", nil)
+type regionImpl struct {
+	APIConf
+	Client *http.Client
+}
+
+//Tenants Tenants
+func (r *regionImpl) Tenants(tenantName string) TenantInterface {
+	return &tenant{prefix: path.Join("/v2/tenants", tenantName), tenantName: tenantName, regionImpl: *r}
+}
+
+//Version Version
+func (r *regionImpl) Version() string {
+	return cmd.GetVersion()
+}
+
+//Resources about resources
+func (r *regionImpl) Resources() ResourcesInterface {
+	return &resources{prefix: "/v2/resources", regionImpl: *r}
+}
+func (r *regionImpl) GetEndpoint() string {
+	return r.Endpoints[0]
+}
+
+//DoRequest do request
+func (r *regionImpl) DoRequest(path, method string, body io.Reader, decode *utilhttp.ResponseBody) (int, error) {
+	request, err := http.NewRequest(method, r.GetEndpoint()+path, body)
 	if err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if code != 200 {
-		return nil, util.CreateAPIHandleError(code, fmt.Errorf("Get database center configs code %d", code))
-	}
-	var res utilhttp.ResponseBody
-	var gc []*dbmodel.K8sPod
-	res.List = &gc
-	if err := ffjson.Unmarshal(body, &res); err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if gc, ok := res.List.(*[]*dbmodel.K8sPod); ok {
-		return *gc, nil
-	}
-	return nil, nil
-}
-func (s *services) Get(name string) (map[string]string, *util.APIHandleError) {
-	body, code, err := request("/v2"+s.tenant.prefix+"/"+s.tenant.tenantID+"/"+s.prefix+"/"+name, "GET", nil)
-	if err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if code != 200 {
-		return nil, util.CreateAPIHandleError(code, fmt.Errorf("Get err with code %d", code))
-	}
-	j, err := simplejson.NewJson(body)
-	if err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	m := make(map[string]string)
-	bean := j.Get("bean")
-	sa, err := bean.Get("serviceAlias").String()
-	si, err := bean.Get("serviceId").String()
-	ti, err := bean.Get("tenantId").String()
-	tn, err := bean.Get("tenantName").String()
-	m["serviceAlias"] = sa
-	m["serviceId"] = si
-	m["tenantId"] = ti
-	m["tenantName"] = tn
-	return m, nil
-}
-func (s *services) EventLog(serviceAlisa, eventID, level string) ([]*model.MessageData, *util.APIHandleError) {
-	data := []byte(`{"event_id":"` + eventID + `","level":"` + level + `"}`)
-	body, code, err := request("/v2"+s.tenant.prefix+"/"+s.tenant.tenantID+"/"+s.prefix+"/event-log", "POST", data)
-	if err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if code != 200 {
-		return nil, util.CreateAPIHandleError(code, fmt.Errorf("Get database center configs code %d", code))
-	}
-	var res utilhttp.ResponseBody
-	var gc []*model.MessageData
-	res.List = &gc
-	if err := ffjson.Unmarshal(body, &res); err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if gc, ok := res.List.(*[]*model.MessageData); ok {
-		return *gc, nil
-	}
-	return nil, nil
-}
-
-func (s *services) List() ([]*model.ServiceStruct, *util.APIHandleError) {
-	body, code, err := request("/v2"+s.tenant.prefix+"/"+s.tenant.tenantID+"/"+s.prefix, "GET", nil)
-
-	if err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if code != 200 {
-		return nil, util.CreateAPIHandleError(code, fmt.Errorf("Get with code %d", code))
-	}
-	var res utilhttp.ResponseBody
-	var gc []*model.ServiceStruct
-	res.List = &gc
-
-	if err := ffjson.Unmarshal(body, &res); err != nil {
-		return nil, util.CreateAPIHandleError(code, err)
-	}
-	if gc, ok := res.List.(*[]*model.ServiceStruct); ok {
-		return *gc, nil
-	}
-	return nil, nil
-}
-func (s *services) Stop(name, eventID string) *util.APIHandleError {
-	data := []byte(`{"event_id":"` + eventID + `"}`)
-	_, code, err := request("/v2"+s.tenant.prefix+"/"+s.tenant.tenantID+"/"+s.prefix+"/"+name+"/stop", "POST", data)
-	return handleErrAndCode(err, code)
-}
-func (s *services) Start(name, eventID string) *util.APIHandleError {
-	data := []byte(`{"event_id":"` + eventID + `"}`)
-	_, code, err := request("/v2"+s.tenant.prefix+"/"+s.tenant.tenantID+"/"+s.prefix+"/"+name+"/start", "POST", data)
-	return handleErrAndCode(err, code)
-}
-
-func request(url, method string, body []byte) ([]byte, int, error) {
-	logrus.Infof("req url is %s", region.regionAPI+url)
-	request, err := http.NewRequest(method, region.regionAPI+url, bytes.NewBuffer(body))
-	if err != nil {
-		return nil, 500, err
+		return 500, err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	if region.token != "" {
-		request.Header.Set("Authorization", "Token "+region.token)
+	if r.Token != "" {
+		request.Header.Set("Authorization", "Token "+r.Token)
 	}
-
-	res, err := http.DefaultClient.Do(request)
+	res, err := r.Client.Do(request)
 	if err != nil {
-		return nil, 500, err
+		return 500, err
 	}
-
-	data, err := ioutil.ReadAll(res.Body)
-	defer res.Body.Close()
-	return data, res.StatusCode, err
-}
-func NewRegion(regionAPI, token, authType string) *Region {
-	if region == nil {
-		region = &Region{
-			regionAPI: regionAPI,
-			token:     token,
-			authType:  authType,
+	if res.Body != nil {
+		defer res.Body.Close()
+	}
+	if decode != nil {
+		if err := json.NewDecoder(res.Body).Decode(decode); err != nil {
+			return res.StatusCode, err
 		}
 	}
-	return region
-}
-func GetRegion() *Region {
-	return region
+	return res.StatusCode, err
 }
 
+//LoadConfig load config
 func LoadConfig(regionAPI, token string) (map[string]map[string]interface{}, error) {
 	if regionAPI != "" {
 		//return nil, errors.New("region api url can not be empty")
@@ -247,13 +200,6 @@ func LoadConfig(regionAPI, token string) (map[string]map[string]interface{}, err
 		if err := json.Unmarshal([]byte(data), &config); err != nil {
 			return nil, err
 		}
-		//{"k8s":{"url":"http://10.0.55.72:8181/api/v1","apitype":"kubernetes api"},
-		//  "db":{"ENGINE":"django.db.backends.mysql",
-		//               "AUTOCOMMIT":true,"ATOMIC_REQUESTS":false,"NAME":"region","CONN_MAX_AGE":0,
-		//"TIME_ZONE":"Asia/Shanghai","OPTIONS":{},
-		// "HOST":"10.0.55.72","USER":"writer1",
-		// "TEST":{"COLLATION":null,"CHARSET":null,"NAME":null,"MIRROR":null},
-		// "PASSWORD":"CeRYK8UzWD","PORT":"3306"}}
 		return config, nil
 	}
 	return nil, errors.New("wrong region api ")
@@ -269,8 +215,52 @@ func handleErrAndCode(err error, code int) *util.APIHandleError {
 	if err != nil {
 		return util.CreateAPIHandleError(code, err)
 	}
-	if code != 200 {
+	if code >= 300 {
 		return util.CreateAPIHandleError(code, fmt.Errorf("error with code %d", code))
+	}
+	return nil
+}
+
+//ResourcesInterface ResourcesInterface
+type ResourcesInterface interface {
+	Tenants(tenantName string) ResourcesTenantInterface
+}
+
+type resources struct {
+	regionImpl
+	prefix string
+}
+
+func (r *resources) Tenants(tenantName string) ResourcesTenantInterface {
+	return &resourcesTenant{prefix: path.Join(r.prefix, "tenants", tenantName), resources: *r}
+}
+
+//ResourcesTenantInterface ResourcesTenantInterface
+type ResourcesTenantInterface interface {
+	Get() (*model.TenantResource, *util.APIHandleError)
+}
+type resourcesTenant struct {
+	resources
+	prefix string
+}
+
+func (r *resourcesTenant) Get() (*model.TenantResource, *util.APIHandleError) {
+	var rt model.TenantResource
+	var decode utilhttp.ResponseBody
+	decode.Bean = &rt
+	code, err := r.DoRequest(r.prefix+"/res", "GET", nil, &decode)
+	if err != nil {
+		return nil, handleErrAndCode(err, code)
+	}
+	return &rt, nil
+}
+
+func handleAPIResult(code int, res utilhttp.ResponseBody) *util.APIHandleError {
+	if code >= 300 {
+		if res.ValidationError != nil && len(res.ValidationError) > 0 {
+			return util.CreateAPIHandleErrorf(code, "msg:%s \napi validation_error: %+v", res.Msg, res.ValidationError)
+		}
+		return util.CreateAPIHandleErrorf(code, "msg:%s", res.Msg)
 	}
 	return nil
 }

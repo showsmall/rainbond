@@ -19,57 +19,80 @@
 package cmd
 
 import (
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
-	"path"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/apcera/termtables"
-	"github.com/goodrain/rainbond/cmd/grctl/option"
-	"github.com/goodrain/rainbond/api/util"
+	"github.com/sirupsen/logrus"
+	"github.com/goodrain/rainbond/util/termtables"
+	eventdb "github.com/goodrain/rainbond/eventlog/db"
 	"github.com/goodrain/rainbond/grctl/clients"
+	coreutil "github.com/goodrain/rainbond/util"
+	"github.com/goodrain/rainbond/util/constants"
 	"github.com/gorilla/websocket"
 	"github.com/gosuri/uitable"
 	"github.com/tidwall/gjson"
 	"github.com/urfave/cli"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	//conf "github.com/goodrain/rainbond/cmd/grctl/option"
 )
 
+//NewCmdService application service command
 func NewCmdService() cli.Command {
 	c := cli.Command{
 		Name:  "service",
-		Usage: "服务相关，grctl service -h",
+		Usage: "about  application service operation，grctl service -h",
 		Subcommands: []cli.Command{
+			cli.Command{
+				Name: "list",
+				Flags: []cli.Flag{
+					cli.StringFlag{
+						Name:     "tenantAlias,t",
+						Value:    "",
+						Usage:    "Specify the tenant alias",
+						FilePath: GetTenantNamePath(),
+					},
+				},
+				Usage: "list show application services runtime detail info。For example <grctl service list -t goodrain>",
+				Action: func(c *cli.Context) error {
+					//logrus.Warn(conf.TenantNamePath)
+					Common(c)
+					return showTenantServices(c)
+				},
+			},
 			cli.Command{
 				Name: "get",
 				Flags: []cli.Flag{
 					cli.StringFlag{
-						Name:  "url",
-						Value: "",
-						Usage: "URL of the app. eg. https://user.goodrain.com/apps/goodrain/dev-debug/detail/ or goodrain/dev-debug",
+						Name:     "tenantAlias,t",
+						Value:    "",
+						Usage:    "Specify the tenant alias",
+						FilePath: GetTenantNamePath(),
 					},
 				},
-				Usage: "获取应用运行详细信息。grctl service get PATH",
+				Usage: "Get application service runtime detail info。For example <grctl service get <service_alias> -t goodrain>",
 				Action: func(c *cli.Context) error {
 					Common(c)
-					return getAppInfoV2(c)
+					return showServiceDeployInfo(c)
 				},
 			},
 			cli.Command{
 				Name:  "start",
-				Usage: "启动应用 grctl service start goodrain/gra564a1 eventID",
+				Usage: "Start an application service, For example <grctl service start goodrain/gra564a1>",
 				Flags: []cli.Flag{
 					cli.BoolFlag{
 						Name:  "f",
-						Usage: "添加此参数日志持续输出。",
+						Usage: "Blocks the output operation log",
+					},
+					cli.StringFlag{
+						Name:     "tenantAlias,t",
+						Value:    "",
+						Usage:    "Specify the tenant alias",
+						FilePath: GetTenantNamePath(),
 					},
 					cli.StringFlag{
 						Name:  "event_log_server",
@@ -83,11 +106,17 @@ func NewCmdService() cli.Command {
 			},
 			cli.Command{
 				Name:  "stop",
-				Usage: "停止应用 grctl service stop goodrain/gra564a1 eventID",
+				Usage: "Stop an application service, For example <grctl service stop goodrain/gra564a1>",
 				Flags: []cli.Flag{
 					cli.BoolFlag{
 						Name:  "f",
-						Usage: "添加此参数日志持续输出。",
+						Usage: "Blocks the output operation log",
+					},
+					cli.StringFlag{
+						Name:     "tenantAlias,t",
+						Value:    "",
+						Usage:    "Specify the tenant alias",
+						FilePath: GetTenantNamePath(),
 					},
 					cli.StringFlag{
 						Name:  "event_log_server",
@@ -104,31 +133,23 @@ func NewCmdService() cli.Command {
 				Flags: []cli.Flag{
 					cli.BoolFlag{
 						Name:  "f",
-						Usage: "添加此参数日志持续输出。",
+						Usage: "Blocks the output operation log",
+					},
+					cli.StringFlag{
+						Name:     "tenantAlias,t",
+						Value:    "",
+						Usage:    "Specify the tenant short id",
+						FilePath: GetTenantNamePath(),
 					},
 					cli.StringFlag{
 						Name:  "event_log_server",
 						Usage: "event log server address",
 					},
 				},
-				Usage: "获取某个操作的日志 grctl service event eventID 123/gr2a2e1b ",
+				Usage: "Blocks the output operation log, For example <grctl service event eventID 123/gr2a2e1b>",
 				Action: func(c *cli.Context) error {
 					Common(c)
 					return getEventLog(c)
-				},
-			},
-			cli.Command{
-				Name: "log",
-				Flags: []cli.Flag{
-					cli.BoolFlag{
-						Name:  "f",
-						Usage: "添加此参数日志持续输出。",
-					},
-				},
-				Usage: "获取服务的日志。grctl service log SERVICE_ID",
-				Action: func(c *cli.Context) error {
-					Common(c)
-					return getLogInfo(c)
 				},
 			},
 		},
@@ -136,8 +157,8 @@ func NewCmdService() cli.Command {
 	return c
 }
 
-func GetEventLogf(eventID, server string) {
-
+//GetEventLogf get event log from websocket
+func GetEventLogf(eventID, server string) error {
 	//if c.String("event_log_server") != "" {
 	//	server = c.String("event_log_server")
 	//}
@@ -146,7 +167,7 @@ func GetEventLogf(eventID, server string) {
 	con, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		logrus.Errorf("dial websocket endpoint %s error. %s", u.String(), err.Error())
-		//return err
+		return err
 	}
 	defer con.Close()
 
@@ -156,7 +177,7 @@ func GetEventLogf(eventID, server string) {
 		_, message, err := con.ReadMessage()
 		if err != nil {
 			logrus.Println("read proxy websocket message error: ", err)
-			return
+			return err
 		}
 		time := gjson.GetBytes(message, "time").String()
 		m := gjson.GetBytes(message, "message").String()
@@ -167,7 +188,6 @@ func GetEventLogf(eventID, server string) {
 func getEventLog(c *cli.Context) error {
 	eventID := c.Args().First()
 	if c.Bool("f") {
-
 		server := "127.0.0.1:6363"
 		if c.String("event_log_server") != "" {
 			server = c.String("event_log_server")
@@ -196,44 +216,48 @@ func getEventLog(c *cli.Context) error {
 			fmt.Printf("[%s](%s) %s \n", strings.ToUpper(level), time, m)
 		}
 	} else {
-		ts := c.Args().Get(1)
-		tas := strings.Split(ts, "/")
-		dl, err := clients.RegionClient.Tenants().Get(tas[0]).Services().EventLog(tas[1], eventID, "debug")
+		logdb := &eventdb.EventFilePlugin{
+			HomePath: constants.GrdataLogPath,
+		}
+		list, err := logdb.GetMessages(eventID, "debug", 0)
 		if err != nil {
 			return err
 		}
-
-		for _, v := range dl {
-			aa, _ := json.Marshal(v)
-			fmt.Println(string(aa))
+		if list != nil {
+			for _, l := range list.(eventdb.MessageDataList) {
+				fmt.Println(l.Time + ":" + l.Message)
+			}
 		}
 	}
 	return nil
 }
 
 func stopTenantService(c *cli.Context) error {
-	//GET /v2/tenants/{tenant_name}/services/{service_alias}
-	//POST /v2/tenants/{tenant_name}/services/{service_alias}/stop
-
-	tenantID := c.Args().First()
-	eventID := c.Args().Get(1)
-	services, err := clients.RegionClient.Tenants().Get(tenantID).Services().List()
+	tenantName := c.Args().First()
+	if tenantName == "" {
+		fmt.Println("Please provide tenant name")
+		os.Exit(1)
+	}
+	eventID := coreutil.NewUUID()
+	services, err := clients.RegionClient.Tenants(tenantName).Services("").List()
 	handleErr(err)
 	for _, service := range services {
-		err := clients.RegionClient.Tenants().Get(tenantID).Services().Stop(service.ServiceAlias, eventID)
-		if c.Bool("f") {
-			server := "127.0.0.1:6363"
-			if c.String("event_log_server") != "" {
-				server = c.String("event_log_server")
+		if service.CurStatus != "closed" && service.CurStatus != "closing" {
+			_, err := clients.RegionClient.Tenants(tenantName).Services(service.ServiceAlias).Stop(eventID)
+			if c.Bool("f") {
+				server := "127.0.0.1:6363"
+				if c.String("event_log_server") != "" {
+					server = c.String("event_log_server")
+				}
+				return GetEventLogf(eventID, server)
 			}
-			GetEventLogf(eventID, server)
-		}
-		//err = region.StopService(service["service_id"].(string), service["deploy_version"].(string))
-		if err != nil {
-			logrus.Error("停止应用失败:" + err.Error())
-			return err
+			if err != nil {
+				logrus.Error("停止应用失败:" + err.Error())
+				return err
+			}
 		}
 	}
+	fmt.Println("EventID:", eventID)
 	return nil
 }
 
@@ -243,45 +267,63 @@ func startService(c *cli.Context) error {
 
 	// goodrain/gra564a1
 	serviceAlias := c.Args().First()
+	tenantName := c.String("tenantAlias")
 	info := strings.Split(serviceAlias, "/")
-
-	eventID := c.Args().Get(1)
-
-	service, err := clients.RegionClient.Tenants().Get(info[0]).Services().Get(info[1])
+	if len(info) >= 2 {
+		tenantName = info[0]
+		serviceAlias = info[1]
+	}
+	if serviceAlias == "" {
+		showError("tenant alias can not be empty")
+	}
+	if serviceAlias == "" {
+		showError("service alias can not be empty")
+	}
+	eventID := coreutil.NewUUID()
+	service, err := clients.RegionClient.Tenants(tenantName).Services(serviceAlias).Get()
 	handleErr(err)
 	if service == nil {
-		return errors.New("应用不存在:" + info[1])
+		return errors.New("Service not exist:" + serviceAlias)
 	}
-	err = clients.RegionClient.Tenants().Get(info[0]).Services().Start(info[1], eventID)
+	_, err = clients.RegionClient.Tenants(tenantName).Services(serviceAlias).Start(eventID)
 	handleErr(err)
 	if c.Bool("f") {
 		server := "127.0.0.1:6363"
 		if c.String("event_log_server") != "" {
 			server = c.String("event_log_server")
 		}
-		GetEventLogf(eventID, server)
+		return GetEventLogf(eventID, server)
 	}
-
 	//err = region.StopService(service["service_id"].(string), service["deploy_version"].(string))
 	if err != nil {
 		logrus.Error("启动应用失败:" + err.Error())
 		return err
 	}
+	fmt.Println("EventID:", eventID)
 	return nil
 }
 
 func stopService(c *cli.Context) error {
-
 	serviceAlias := c.Args().First()
+	tenantName := c.String("tenantAlias")
 	info := strings.Split(serviceAlias, "/")
-
-	eventID := c.Args().Get(1)
-	service, err := clients.RegionClient.Tenants().Get(info[0]).Services().Get(info[1])
+	if len(info) >= 2 {
+		tenantName = info[0]
+		serviceAlias = info[1]
+	}
+	if serviceAlias == "" {
+		showError("tenant alias can not be empty")
+	}
+	if serviceAlias == "" {
+		showError("service alias can not be empty")
+	}
+	eventID := coreutil.NewUUID()
+	service, err := clients.RegionClient.Tenants(tenantName).Services(serviceAlias).Get()
 	handleErr(err)
 	if service == nil {
-		return errors.New("应用不存在:" + info[1])
+		return errors.New("Service not exist:" + serviceAlias)
 	}
-	err = clients.RegionClient.Tenants().Get(info[0]).Services().Stop(info[1], eventID)
+	_, err = clients.RegionClient.Tenants(tenantName).Services(serviceAlias).Stop(eventID)
 	handleErr(err)
 	if c.Bool("f") {
 		server := "127.0.0.1:6363"
@@ -290,123 +332,123 @@ func stopService(c *cli.Context) error {
 		}
 		GetEventLogf(eventID, server)
 	}
+	fmt.Println("EventID:", eventID)
 	return nil
 }
-
-func getAppInfoV2(c *cli.Context) error {
-	value := c.Args().First()
-	// https://user.goodrain.com/apps/goodrain/dev-debug/detail/
-	// http://dev.goodrain.org/#/team/x749pdls/region/private-center/app/gr7c6929/overview
-	var tenantName, serviceAlias string
-	if strings.HasPrefix(value, "http") {
-		fmt.Println(value)
-		info := strings.Split(value, "#")
-		if len(info) < 2 {
-			return errors.New("参数错误")
-		}
-		paths := strings.Split(info[1], "/")
-		if len(paths) < 7 {
-			logrus.Error("参数错误")
-			return errors.New("参数错误")
-		}
-		tenantName = paths[2]
-		serviceAlias = paths[6]
-	} else if strings.Contains(value, "/") {
-		paths := strings.Split(value, "/")
-		if len(paths) < 2 {
-			logrus.Error("参数错误")
-			return errors.New("参数错误")
-		}
-		tenantName = paths[0]
-		serviceAlias = paths[1]
-	} else {
-		serviceAlias = value
+func showServiceDeployInfo(c *cli.Context) error {
+	serviceAlias := c.Args().First()
+	tenantName := c.String("tenantAlias")
+	info := strings.Split(serviceAlias, "/")
+	if len(info) >= 2 {
+		tenantName = info[0]
+		serviceAlias = info[1]
 	}
-	service, err := clients.RegionClient.Tenants().Get(tenantName).Services().Get(serviceAlias)
+	if tenantName == "" {
+		showError("tenant alias can not be empty")
+	}
+	if serviceAlias == "" {
+		showError("service alias can not be empty")
+	}
+	service, err := clients.RegionClient.Tenants(tenantName).Services(serviceAlias).Get()
 	handleErr(err)
 	if service == nil {
-		fmt.Println("not found")
-		return nil
+		return errors.New("Service not exist:" + serviceAlias)
 	}
+	deployInfo, err := clients.RegionClient.Tenants(tenantName).Services(serviceAlias).GetDeployInfo()
+	handleErr(err)
 
 	table := uitable.New()
 	table.Wrap = true // wrap columns
-	tenantID := service["tenantId"]
-	serviceID := service["serviceId"]
-	//volumes:=service[""]
-
+	tenantID := service.TenantID
+	serviceID := service.ServiceID
 	table.AddRow("Namespace:", tenantID)
 	table.AddRow("ServiceID:", serviceID)
-	//table.AddRow("Volume:", volumes)
-
-	option := metav1.ListOptions{LabelSelector: "name=" + serviceAlias}
-	ps, err := clients.RegionClient.Tenants().Get(tenantName).Services().Pods(serviceAlias)
-	handleErr(err)
-
-	var rcMap = make(map[string]string)
-	for _, v := range ps {
-		rcMap["Type"] = v.ReplicationType
-		rcMap["ID"] = v.ReplicationID
-		break
+	if deployInfo.Deployment != "" {
+		table.AddRow("ReplicationType:", "deployment")
+		table.AddRow("ReplicationID:", deployInfo.Deployment)
+	} else if deployInfo.Statefuleset != "" {
+		table.AddRow("ReplicationType:", "statefulset")
+		table.AddRow("ReplicationID:", deployInfo.Statefuleset)
 	}
-	table.AddRow("ReplicationType:", rcMap["Type"])
-	table.AddRow("ReplicationID:", rcMap["ID"])
-	serviceOption := metav1.ListOptions{}
-	//grf1cdd7Service
-	//serviceOption := metav1.ListOptions{LabelSelector: "spec.selector.name="+"gr2a2e1b" }
-
-	services, error := clients.K8SClient.Core().Services(tenantID).List(serviceOption)
-	handleErr(util.CreateAPIHandleError(500, error))
-
+	table.AddRow("Status:", deployInfo.Status)
+	fmt.Println(table)
+	//show services
 	serviceTable := termtables.CreateTable()
 	serviceTable.AddHeaders("Name", "IP", "Port")
-
-	var serviceMap = make(map[string]string)
-	for _, service := range services.Items {
-		if service.Spec.Selector["name"] == serviceAlias {
-			serviceMap["Name"] = service.Name
-			var ports string
-			if service.Spec.Ports != nil && len(service.Spec.Ports) > 0 {
-				for _, p := range service.Spec.Ports {
-					ports += fmt.Sprintf("(%s:%s)", p.Protocol, p.TargetPort.String())
+	for serviceID := range deployInfo.Services {
+		if clients.K8SClient != nil {
+			service, _ := clients.K8SClient.CoreV1().Services(tenantID).Get(serviceID, metav1.GetOptions{})
+			if service != nil {
+				var ports string
+				if service.Spec.Ports != nil && len(service.Spec.Ports) > 0 {
+					for _, p := range service.Spec.Ports {
+						ports += fmt.Sprintf("(%s:%s)", p.Protocol, p.TargetPort.String())
+					}
 				}
+				serviceTable.AddRow(service.Name, service.Spec.ClusterIP, ports)
 			}
-			serviceMap["Ports"] = ports
-			serviceMap["ClusterIP"] = service.Spec.ClusterIP
-			serviceTable.AddRow(service.Name, service.Spec.ClusterIP, ports)
+		} else {
+			serviceTable.AddRow(serviceID, "-", "-")
 		}
 	}
-	table.AddRow("Services:", "")
-	fmt.Println(table)
+	fmt.Println("------------Service------------")
 	fmt.Println(serviceTable.Render())
-
-	//"ServiceID": "92fdfe7e22639be491953c1fd92a2e1b",
-	//	"ReplicationID": "695cdb83147041bd9b2777659e981a9a",
-	//	"ReplicationType": "replicationcontroller",
-	//	"PodName": "695cdb83147041bd9b2777659e981a9a-gh4pn"
-
-	if clients.K8SClient == nil {
-
-		for i, v := range ps {
-
-			table := uitable.New()
-			table.Wrap = true // wrap columns
-			fmt.Printf("-------------------Pod_%d-----------------------\n", i)
-			table.AddRow("PodName:", v.PodName)
-			table.AddRow("ServiceID:", v.ServiceID)
-			table.AddRow("ReplicationType:", v.ReplicationType)
-			table.AddRow("ReplicationID:", v.ReplicationID)
-
-			fmt.Println(table)
+	//show endpoints
+	if deployInfo.Endpoints != nil && len(deployInfo.Endpoints) > 0 {
+		epTable := termtables.CreateTable()
+		epTable.AddHeaders("Name", "IP", "Port", "Protocol")
+		for epname := range deployInfo.Endpoints {
+			if clients.K8SClient != nil {
+				ep, _ := clients.K8SClient.CoreV1().Endpoints(tenantID).Get(epname, metav1.GetOptions{})
+				if ep != nil {
+					for i := range ep.Subsets {
+						ss := &ep.Subsets[i]
+						for j := range ss.Ports {
+							port := &ss.Ports[j]
+							for k := range ss.Addresses {
+								address := &ss.Addresses[k]
+								epTable.AddRow(ep.Name, address.IP, port.Port, port.Protocol)
+							}
+							for k := range ss.NotReadyAddresses {
+								address := &ss.NotReadyAddresses[k]
+								epTable.AddRow(ep.Name, address.IP, port.Port, port.Protocol)
+							}
+						}
+					}
+				}
+			} else {
+				epTable.AddRow(epname, "-", "-", "-")
+			}
 		}
-	} else {
-
-		pods, err := clients.K8SClient.Core().Pods(tenantID).List(option)
-		if err != nil {
-			return err
+		fmt.Println("------------endpoints------------")
+		fmt.Println(epTable.Render())
+	}
+	//show ingress
+	ingressTable := termtables.CreateTable()
+	ingressTable.AddHeaders("Name", "Host")
+	for ingressID := range deployInfo.Ingresses {
+		if clients.K8SClient != nil {
+			ingress, _ := clients.K8SClient.ExtensionsV1beta1().Ingresses(tenantID).Get(ingressID, metav1.GetOptions{})
+			if ingress != nil {
+				for _, rule := range ingress.Spec.Rules {
+					ingressTable.AddRow(ingress.Name, rule.Host)
+				}
+			}
+		} else {
+			ingressTable.AddRow(ingressID, "-")
 		}
-		for i, pod := range pods.Items {
-
+	}
+	fmt.Println("------------Ingress------------")
+	fmt.Println(ingressTable.Render())
+	//show pods
+	var i = 0
+	for podID := range deployInfo.Pods {
+		i++
+		if clients.K8SClient != nil {
+			pod, err := clients.K8SClient.CoreV1().Pods(tenantID).Get(podID, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
 			table := uitable.New()
 			table.Wrap = true // wrap columns
 			fmt.Printf("-------------------Pod_%d-----------------------\n", i)
@@ -422,21 +464,41 @@ func getAppInfoV2(c *cli.Context) error {
 			if pod.Spec.Volumes != nil && len(pod.Spec.Volumes) > 0 {
 				value := ""
 				for _, v := range pod.Spec.Volumes {
+					valueline := ""
 					if v.HostPath != nil {
-						value += v.HostPath.Path
-						for _, vc := range pod.Spec.Containers {
-							m := vc.VolumeMounts
-							for _, v2 := range m {
-								if v2.Name == v.Name {
-									value += ":" + string(v2.MountPath)
+						valueline += v.HostPath.Path
+					}
+					if v.PersistentVolumeClaim != nil {
+						claimName := v.PersistentVolumeClaim.ClaimName
+						pvc, _ := clients.K8SClient.CoreV1().PersistentVolumeClaims(tenantID).Get(claimName, metav1.GetOptions{})
+						if pvc != nil {
+							pvn := pvc.Spec.VolumeName
+							pv, _ := clients.K8SClient.CoreV1().PersistentVolumes().Get(pvn, metav1.GetOptions{})
+							if pv != nil {
+								if hostPath := pv.Spec.HostPath; hostPath != nil {
+									valueline += hostPath.Path
 								}
 							}
 						}
-						value += "\n"
 					}
+					//if not pvc, do not show
+					if valueline == "" {
+						continue
+					}
+					value += valueline
+				con:
+					for _, vc := range pod.Spec.Containers {
+						m := vc.VolumeMounts
+						for _, v2 := range m {
+							if v2.Name == v.Name {
+								value += ":" + string(v2.MountPath)
+								break con
+							}
+						}
+					}
+					value += "\n"
 				}
 				table.AddRow("PodVolumePath:", value)
-
 			}
 			if pod.Status.StartTime != nil {
 				table.AddRow("PodStratTime:", pod.Status.StartTime.Format(time.RFC3339))
@@ -446,79 +508,63 @@ func getAppInfoV2(c *cli.Context) error {
 			containerTable := termtables.CreateTable()
 			containerTable.AddHeaders("ID", "Name", "Image", "State")
 			for j := 0; j < len(pod.Status.ContainerStatuses); j++ {
-				var t string
-				con := pod.Status.ContainerStatuses[j]
-				if con.State.Running != nil {
-					t = con.State.Running.StartedAt.Format(time.RFC3339)
-				}
-				var conID string
-				if con.ContainerID != "" {
-					conID = con.ContainerID[9:21]
-				}
-				containerTable.AddRow(conID, con.Name, con.Image, t)
+				cstatus := pod.Status.ContainerStatuses[j]
+				cid, s := getContainerIDAndState(cstatus)
+				containerTable.AddRow(cid, cstatus.Name, cstatus.Image, s)
 			}
 			fmt.Println(containerTable.Render())
+		} else {
+			fmt.Printf("-------------------Pod_%d-----------------------\n", i)
+			tablepod := uitable.New()
+			tablepod.AddRow("PodName:", podID)
+			fmt.Println(tablepod)
 		}
 	}
 	return nil
 }
-func GetServiceAliasID(ServiceID string) string {
-	if len(ServiceID) > 11 {
-		newWord := strconv.Itoa(int(ServiceID[10])) + ServiceID + strconv.Itoa(int(ServiceID[3])) + "log" + strconv.Itoa(int(ServiceID[2])/7)
-		ha := sha256.New224()
-		ha.Write([]byte(newWord))
-		return fmt.Sprintf("%x", ha.Sum(nil))[0:16]
+
+func getContainerIDAndState(status corev1.ContainerStatus) (cid, s string) {
+	state := status.State
+	containerID := status.ContainerID
+	if state.Running != nil {
+		s = fmt.Sprintf("Running(%s)", state.Running.StartedAt.Format(time.RFC3339))
 	}
-	return ServiceID
+	if state.Waiting != nil {
+		s = "Waiting"
+	}
+	if state.Terminated != nil {
+		s = "Terminated"
+		containerID = state.Terminated.ContainerID
+	}
+	if containerID != "" {
+		cid = containerID[9:21]
+	}
+	return
 }
 
-// grctrl log SERVICE_ID
-func getLogInfo(c *cli.Context) error {
-	value := c.Args().Get(0)
-	// tenantID, err := db.FindNamespaceByServiceID(value)
-	// if err != nil {
-	// 	logrus.Error(err.Error())
-	// 	return err
-	// }
-	alias := GetServiceAliasID(value)
-	config := option.GetConfig()
-	logFilePath := path.Join(config.DockerLogPath, alias, "stdout.log")
-
-	//logrus.Info(logFilePath)
-	var cmd exec.Cmd
-
-	if c.Bool("f") {
-		tail, err := exec.LookPath("tail")
-		if err != nil {
-			logrus.Error("Don't find the tail.", err.Error())
-			return err
-		}
-		cmd = exec.Cmd{
-			Env:    os.Environ(),
-			Path:   tail,
-			Args:   []string{tail, "-f", logFilePath},
-			Stdin:  os.Stdin,
-			Stdout: os.Stdout,
-			Stderr: os.Stderr,
-		}
-	} else {
-		cat, err := exec.LookPath("cat")
-		if err != nil {
-			logrus.Error("Don't find the cat.", err.Error())
-			return err
-		}
-		cmd = exec.Cmd{
-			Env:    os.Environ(),
-			Path:   cat,
-			Args:   []string{cat, logFilePath},
-			Stdin:  os.Stdin,
-			Stdout: os.Stdout,
-			Stderr: os.Stderr,
-		}
+func showTenantServices(ctx *cli.Context) error {
+	tenantAlias := ctx.String("tenantAlias")
+	if tenantAlias == "" {
+		showError("tenant alias can not be empty")
 	}
-	if err := cmd.Run(); err != nil {
-		logrus.Error("Log error.", err.Error())
-		return err
+	services, err := clients.RegionClient.Tenants(tenantAlias).Services("").List()
+	handleErr(err)
+	if services != nil {
+		runtable := termtables.CreateTable()
+		closedtable := termtables.CreateTable()
+		runtable.AddHeaders("服务别名", "应用状态", "Deploy版本", "实例数量", "内存占用")
+		closedtable.AddHeaders("服务ID", "服务别名", "应用状态", "Deploy版本")
+		for _, service := range services {
+			if service.CurStatus != "closed" && service.CurStatus != "closing" && service.CurStatus != "undeploy" && service.CurStatus != "deploying" {
+				runtable.AddRow(service.ServiceAlias, service.CurStatus, service.DeployVersion, service.Replicas, fmt.Sprintf("%d Mb", service.ContainerMemory*service.Replicas))
+			} else {
+				closedtable.AddRow(service.ServiceID, service.ServiceAlias, service.CurStatus, service.DeployVersion)
+			}
+		}
+		fmt.Println("运行中的应用：")
+		fmt.Println(runtable.Render())
+		fmt.Println("不在运行的应用：")
+		fmt.Println(closedtable.Render())
 	}
 	return nil
 }

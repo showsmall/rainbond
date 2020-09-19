@@ -21,8 +21,6 @@ package dao
 import (
 	"github.com/goodrain/rainbond/db/model"
 
-	"fmt"
-
 	"github.com/jinzhu/gorm"
 )
 
@@ -35,9 +33,7 @@ func (c *CodeCheckResultDaoImpl) AddModel(mo model.Interface) error {
 			return err
 		}
 	} else {
-		fmt.Errorf("codecheck result is exist")
 		update(result, &oldResult)
-
 		if err := c.DB.Save(&oldResult).Error; err != nil {
 			return err
 		}
@@ -102,4 +98,9 @@ func (c *CodeCheckResultDaoImpl) GetCodeCheckResult(serviceID string) (*model.Co
 		return nil, err
 	}
 	return &result, nil
+}
+
+// DeleteByServiceID deletes a CodeCheckResult base on serviceID.
+func (c *CodeCheckResultDaoImpl) DeleteByServiceID(serviceID string) error {
+	return c.DB.Where("service_id=?", serviceID).Delete(&model.CodeCheckResult{}).Error
 }

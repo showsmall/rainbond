@@ -20,21 +20,21 @@ package event
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/goodrain/rainbond/discover"
 	"github.com/goodrain/rainbond/discover/config"
-	"github.com/goodrain/rainbond/util"
-
-	"github.com/pquerna/ffjson/ffjson"
-
-	"github.com/Sirupsen/logrus"
-
 	eventclient "github.com/goodrain/rainbond/eventlog/entry/grpc/client"
 	eventpb "github.com/goodrain/rainbond/eventlog/entry/grpc/pb"
-
+	"github.com/goodrain/rainbond/util"
+	etcdutil "github.com/goodrain/rainbond/util/etcd"
+	"github.com/pquerna/ffjson/ffjson"
 	"golang.org/x/net/context"
 )
 
@@ -46,9 +46,11 @@ type Manager interface {
 	Close() error
 	ReleaseLogger(Logger)
 }
+
+// EventConfig event config struct
 type EventConfig struct {
 	EventLogServers []string
-	DiscoverAddress []string
+	DiscoverArgs    *etcdutil.ClientArgs
 }
 type manager struct {
 	ctx            context.Context
@@ -70,11 +72,12 @@ const (
 	REQUESTTIMEOUT = 1000 * time.Millisecond
 	//MAXRETRIES 重试
 	MAXRETRIES = 3 //  Before we abandon
+	buffersize = 1000
 )
 
 //NewManager 创建manager
 func NewManager(conf EventConfig) error {
-	dis, err := discover.GetDiscover(config.DiscoverConfig{EtcdClusterEndpoints: conf.DiscoverAddress})
+	dis, err := discover.GetDiscover(config.DiscoverConfig{EtcdClientArgs: conf.DiscoverArgs})
 	if err != nil {
 		logrus.Error("create discover manager error.", err.Error())
 		if len(conf.EventLogServers) < 1 {
@@ -100,6 +103,11 @@ func GetManager() Manager {
 	return defaultManager
 }
 
+// NewTestManager -
+func NewTestManager(m Manager) {
+	defaultManager = m
+}
+
 //CloseManager 关闭日志服务
 func CloseManager() {
 	if defaultManager != nil {
@@ -112,7 +120,7 @@ func (m *manager) Start() error {
 	defer m.lock.Unlock()
 	for i := 0; i < len(m.eventServer); i++ {
 		h := handle{
-			cacheChan: make(chan []byte, 100),
+			cacheChan: make(chan []byte, buffersize),
 			stop:      make(chan struct{}),
 			server:    m.eventServer[i],
 			manager:   m,
@@ -134,7 +142,6 @@ func (m *manager) UpdateEndpoints(endpoints ...*config.Endpoint) {
 	if endpoints == nil || len(endpoints) < 1 {
 		return
 	}
-	logrus.Infof("Update event server endpoint,%+v", endpoints)
 	//清空不可用节点信息，以服务发现为主
 	m.abnormalServer = make(map[string]string)
 	//增加新节点
@@ -143,13 +150,14 @@ func (m *manager) UpdateEndpoints(endpoints ...*config.Endpoint) {
 		new[end.URL] = end.URL
 		if _, ok := m.handles[end.URL]; !ok {
 			h := handle{
-				cacheChan: make(chan []byte, 100),
+				cacheChan: make(chan []byte, buffersize),
 				stop:      make(chan struct{}),
 				server:    end.URL,
 				manager:   m,
 				ctx:       m.ctx,
 			}
 			m.handles[end.URL] = h
+			logrus.Infof("Add event server endpoint,%s", end.URL)
 			go h.HandleLog()
 		}
 	}
@@ -157,6 +165,7 @@ func (m *manager) UpdateEndpoints(endpoints ...*config.Endpoint) {
 	for k := range m.handles {
 		if _, ok := new[k]; !ok {
 			delete(m.handles, k)
+			logrus.Infof("Remove event server endpoint,%s", k)
 		}
 	}
 	var eventServer []string
@@ -164,8 +173,7 @@ func (m *manager) UpdateEndpoints(endpoints ...*config.Endpoint) {
 		eventServer = append(eventServer, k)
 	}
 	m.eventServer = eventServer
-	logrus.Infof("update event handle core success,handle core count:%d, event server count:%d", len(m.handles), len(m.eventServer))
-
+	logrus.Debugf("update event handle core success,handle core count:%d, event server count:%d", len(m.handles), len(m.eventServer))
 }
 
 func (m *manager) Error(err error) {
@@ -210,11 +218,7 @@ func (m *manager) GetLogger(eventID string) Logger {
 	if l, ok := m.loggers[eventID]; ok {
 		return l
 	}
-	l := &logger{
-		event:      eventID,
-		sendChan:   m.getLBChan(),
-		createTime: time.Now(),
-	}
+	l := NewLogger(eventID, m.getLBChan())
 	m.loggers[eventID] = l
 	return l
 }
@@ -257,13 +261,14 @@ func (m *manager) getLBChan() chan []byte {
 		m.qos = atomic.AddInt32(&(m.qos), 1)
 		server := m.eventServer[index]
 		if _, ok := m.abnormalServer[server]; ok {
+			logrus.Warnf("server[%s] is abnormal, skip it", server)
 			continue
 		}
 		if h, ok := m.handles[server]; ok {
 			return h.cacheChan
 		}
 		h := handle{
-			cacheChan: make(chan []byte, 100),
+			cacheChan: make(chan []byte, buffersize),
 			stop:      make(chan struct{}),
 			server:    server,
 			manager:   m,
@@ -273,11 +278,10 @@ func (m *manager) getLBChan() chan []byte {
 		go h.HandleLog()
 		return h.cacheChan
 	}
-	//实在选不出节点了，返回列表第一个
+	//not select, return first handle chan
 	for _, v := range m.handles {
 		return v.cacheChan
 	}
-	//列表不存在，返回nil
 	return nil
 }
 func (m *manager) RemoveHandle(server string) {
@@ -340,6 +344,16 @@ type Logger interface {
 	CreateTime() time.Time
 	GetChan() chan []byte
 	SetChan(chan []byte)
+	GetWriter(step, level string) LoggerWriter
+}
+
+// NewLogger creates a new Logger.
+func NewLogger(eventID string, sendCh chan []byte) Logger {
+	return &logger{
+		event:      eventID,
+		sendChan:   sendCh,
+		createTime: time.Now(),
+	}
 }
 
 type logger struct {
@@ -391,6 +405,74 @@ func (l *logger) send(message string, info map[string]string) {
 	}
 }
 
+//LoggerWriter logger writer
+type LoggerWriter interface {
+	io.Writer
+	SetFormat(map[string]interface{})
+}
+
+func (l *logger) GetWriter(step, level string) LoggerWriter {
+	return &loggerWriter{
+		l:     l,
+		step:  step,
+		level: level,
+	}
+}
+
+type loggerWriter struct {
+	l           *logger
+	step        string
+	level       string
+	fmt         map[string]interface{}
+	tmp         []byte
+	lastMessage string
+}
+
+func (l *loggerWriter) SetFormat(f map[string]interface{}) {
+	l.fmt = f
+}
+func (l *loggerWriter) Write(b []byte) (n int, err error) {
+	if b != nil && len(b) > 0 {
+		if !strings.HasSuffix(string(b), "\n") {
+			l.tmp = append(l.tmp, b...)
+			return len(b), nil
+		}
+		var message string
+		if len(l.tmp) > 0 {
+			message = string(append(l.tmp, b...))
+			l.tmp = l.tmp[:0]
+		} else {
+			message = string(b)
+		}
+		// if loggerWriter has format, and then use it format message
+		if len(l.fmt) > 0 {
+			newLineMap := make(map[string]interface{}, len(l.fmt))
+			for k, v := range l.fmt {
+				if v == "%s" {
+					newLineMap[k] = fmt.Sprintf(v.(string), message)
+				} else {
+					newLineMap[k] = v
+				}
+			}
+			messageb, _ := ffjson.Marshal(newLineMap)
+			message = string(messageb)
+		}
+		if l.step == "build-progress" {
+			if strings.HasPrefix(message, "Progress ") && strings.HasPrefix(l.lastMessage, "Progress ") {
+				l.lastMessage = message
+				return len(b), nil
+			}
+			// send last message
+			if !strings.HasPrefix(message, "Progress ") && strings.HasPrefix(l.lastMessage, "Progress ") {
+				l.l.send(message, map[string]string{"step": l.lastMessage, "level": l.level})
+			}
+		}
+		l.l.send(message, map[string]string{"step": l.step, "level": l.level})
+		l.lastMessage = message
+	}
+	return len(b), nil
+}
+
 //GetTestLogger GetTestLogger
 func GetTestLogger() Logger {
 	return &testLogger{}
@@ -419,4 +501,18 @@ func (l *testLogger) Error(message string, info map[string]string) {
 }
 func (l *testLogger) Debug(message string, info map[string]string) {
 	fmt.Println("debug:", message)
+}
+
+type testLoggerWriter struct {
+}
+
+func (l *testLoggerWriter) SetFormat(f map[string]interface{}) {
+
+}
+func (l *testLoggerWriter) Write(b []byte) (n int, err error) {
+	return os.Stdout.Write(b)
+}
+
+func (l *testLogger) GetWriter(step, level string) LoggerWriter {
+	return &testLoggerWriter{}
 }

@@ -19,23 +19,26 @@
 package util
 
 import (
-	"archive/zip"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/twinj/uuid"
+	"github.com/sirupsen/logrus"
+	"github.com/goodrain/rainbond/util/zip"
 )
 
 //CheckAndCreateDir check and create dir
@@ -52,6 +55,26 @@ func CheckAndCreateDir(path string) error {
 		}
 
 		if err := os.Chmod(path, 0755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+//CheckAndCreateDirByMode check and create dir
+func CheckAndCreateDirByMode(path string, mode os.FileMode) error {
+	if subPathExists, err := FileExists(path); err != nil {
+		return fmt.Errorf("Could not determine if subPath %s exists; will not attempt to change its permissions", path)
+	} else if !subPathExists {
+		// Create the sub path now because if it's auto-created later when referenced, it may have an
+		// incorrect ownership and mode. For example, the sub path directory must have at least g+rwx
+		// when the pod specifies an fsGroup, and if the directory is not created here, Docker will
+		// later auto-create it with the incorrect mode 0750
+		if err := os.MkdirAll(path, mode); err != nil {
+			return fmt.Errorf("failed to mkdir:%s", path)
+		}
+
+		if err := os.Chmod(path, mode); err != nil {
 			return err
 		}
 	}
@@ -162,7 +185,7 @@ func CmdRunWithTimeout(cmd *exec.Cmd, timeout time.Duration) (bool, error) {
 		go func() {
 			<-done // allow goroutine to exit
 		}()
-		logrus.Info("process:%s killed", cmd.Path)
+		logrus.Infof("process:%s killed", cmd.Path)
 		return true, err
 	case err = <-done:
 		return false, err
@@ -173,12 +196,19 @@ func CmdRunWithTimeout(cmd *exec.Cmd, timeout time.Duration) (bool, error) {
 //ID是节点的唯一标识，acp_node将把ID与机器信息的绑定关系维护于etcd中
 func ReadHostID(filePath string) (string, error) {
 	if filePath == "" {
-		filePath = "/opt/rainbond/etc/node/node_host_uuid.conf"
+		if runtime.GOOS == "windows" {
+			filePath = "c:\\rainbond\\node_host_uuid.conf"
+		} else {
+			filePath = "/opt/rainbond/etc/node/node_host_uuid.conf"
+		}
 	}
 	_, err := os.Stat(filePath)
 	if err != nil {
-		if strings.HasSuffix(err.Error(), "no such file or directory") {
-			uid := uuid.NewV4().String()
+		if os.IsNotExist(err) {
+			uid, err := CreateHostID()
+			if err != nil {
+				return "", err
+			}
 			err = ioutil.WriteFile(filePath, []byte("host_uuid="+uid), 0777)
 			if err != nil {
 				logrus.Error("Write host_uuid file error.", err.Error())
@@ -196,6 +226,42 @@ func ReadHostID(filePath string) (string, error) {
 		return info[1], nil
 	}
 	return "", fmt.Errorf("Invalid host uuid from file")
+}
+
+//CreateHostID create host id by mac addr
+func CreateHostID() (string, error) {
+	macAddrs := getMacAddrs()
+	if macAddrs == nil || len(macAddrs) == 0 {
+		return "", fmt.Errorf("read macaddr error when create node id")
+	}
+	ip, _ := LocalIP()
+	hash := md5.New()
+	hash.Write([]byte(macAddrs[0] + ip.String()))
+	uid := fmt.Sprintf("%x", hash.Sum(nil))
+	if len(uid) >= 32 {
+		return uid[:32], nil
+	}
+	for i := len(uid); i < 32; i++ {
+		uid = uid + "0"
+	}
+	return uid, nil
+}
+
+func getMacAddrs() (macAddrs []string) {
+	netInterfaces, err := net.Interfaces()
+	if err != nil {
+		fmt.Printf("fail to get net interfaces: %v", err)
+		return macAddrs
+	}
+
+	for _, netInterface := range netInterfaces {
+		macAddr := netInterface.HardwareAddr.String()
+		if len(macAddr) == 0 {
+			continue
+		}
+		macAddrs = append(macAddrs, macAddr)
+	}
+	return macAddrs
 }
 
 //LocalIP 获取本机 ip
@@ -400,7 +466,7 @@ func Zip(source, target string) error {
 	if err := CheckAndCreateDir(filepath.Dir(target)); err != nil {
 		return err
 	}
-	zipfile, err := os.Create(target)
+	zipfile, err := os.OpenFile(target, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		return err
 	}
@@ -448,8 +514,7 @@ func Zip(source, target string) error {
 		if info.IsDir() {
 			return nil
 		}
-
-		file, err := os.Open(path)
+		file, err := os.OpenFile(path, os.O_RDONLY, 0)
 		if err != nil {
 			return err
 		}
@@ -463,15 +528,13 @@ func Zip(source, target string) error {
 
 //Unzip archive file to target dir
 func Unzip(archive, target string) error {
-	reader, err := zip.OpenReader(archive)
+	reader, err := zip.OpenDirectReader(archive)
 	if err != nil {
-		return err
+		return fmt.Errorf("error opening archive: %v", err)
 	}
-
 	if err := os.MkdirAll(target, 0755); err != nil {
 		return err
 	}
-
 	for _, file := range reader.File {
 		run := func() error {
 			path := filepath.Join(target, file.Name)
@@ -483,7 +546,7 @@ func Unzip(archive, target string) error {
 						uid, _ := strconv.Atoi(guid[0])
 						gid, _ := strconv.Atoi(guid[1])
 						if err := os.Chown(path, uid, gid); err != nil {
-							return err
+							return fmt.Errorf("error changing owner: %v", err)
 						}
 					}
 				}
@@ -492,18 +555,17 @@ func Unzip(archive, target string) error {
 
 			fileReader, err := file.Open()
 			if err != nil {
-				return err
+				return fmt.Errorf("fileReader; error opening file: %v", err)
 			}
 			defer fileReader.Close()
-
 			targetFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
 			if err != nil {
-				return err
+				return fmt.Errorf("targetFile; error opening file: %v", err)
 			}
 			defer targetFile.Close()
 
 			if _, err := io.Copy(targetFile, fileReader); err != nil {
-				return err
+				return fmt.Errorf("error copy file: %v", err)
 			}
 			if file.Comment != "" && strings.Contains(file.Comment, "/") {
 				guid := strings.Split(file.Comment, "/")
@@ -520,6 +582,39 @@ func Unzip(archive, target string) error {
 		if err := run(); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// CopyFile copy source file to target
+// direct io read and write file
+// Keep the permissions user and group
+func CopyFile(source, target string) error {
+	sfi, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	elem := reflect.ValueOf(sfi.Sys()).Elem()
+	uid := elem.FieldByName("Uid").Uint()
+	gid := elem.FieldByName("Gid").Uint()
+	sf, err := os.OpenFile(source, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+	tf, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, sfi.Mode())
+	if err != nil {
+		return err
+	}
+	defer tf.Close()
+	_, err = io.Copy(tf, sf)
+	if err != nil {
+		return err
+	}
+
+	if err := os.Chown(target, int(uid), int(gid)); err != nil {
+		return err
 	}
 
 	return nil
@@ -574,8 +669,7 @@ func MergeDir(fromdir, todir string) error {
 //CreateVersionByTime create version number
 func CreateVersionByTime() string {
 	now := time.Now()
-	re := fmt.Sprintf("%d%d%d%d%d%d%d", now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond())
-	return re
+	return now.Format("20060102150405")
 }
 
 // GetDirList get all lower level dir
@@ -601,6 +695,7 @@ func GetDirList(dirpath string, level int) ([]string, error) {
 	return dirlist, nil
 }
 
+//GetFileList -
 func GetFileList(dirpath string, level int) ([]string, error) {
 	var dirlist []string
 	list, err := ioutil.ReadDir(dirpath)
@@ -642,4 +737,55 @@ func GetDirNameList(dirpath string, level int) ([]string, error) {
 		}
 	}
 	return dirlist, nil
+}
+
+//GetCurrentDir get current dir
+func GetCurrentDir() string {
+	dir, err := filepath.Abs("./")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return strings.Replace(dir, "\\", "/", -1)
+}
+
+//IsDir path is dir
+func IsDir(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	return info.IsDir(), nil
+}
+
+var reg = regexp.MustCompile(`(?U)\$\{.*\}`)
+
+//ParseVariable parse and replace variable in source str
+func ParseVariable(source string, configs map[string]string) string {
+	resultKey := reg.FindAllString(source, -1)
+	for _, sourcekey := range resultKey {
+		key, defaultValue := getVariableKey(sourcekey)
+		if value, ok := configs[key]; ok {
+			source = strings.Replace(source, sourcekey, value, -1)
+		} else if defaultValue != "" {
+			source = strings.Replace(source, sourcekey, defaultValue, -1)
+		}
+	}
+	return source
+}
+
+func getVariableKey(source string) (key, value string) {
+	if len(source) < 4 {
+		return "", ""
+	}
+	left := strings.Index(source, "{")
+	right := strings.Index(source, "}")
+	k := source[left+1 : right]
+	if strings.Contains(k, ":") {
+		re := strings.Split(k, ":")
+		if len(re) > 1 {
+			return re[0], re[1]
+		}
+		return re[0], ""
+	}
+	return k, ""
 }

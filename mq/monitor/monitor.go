@@ -18,7 +18,10 @@
 
 package monitor
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/goodrain/rainbond/mq/api/mq"
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // Metric name parts.
 const (
@@ -39,15 +42,24 @@ var (
 
 //Exporter collects entrance metrics. It implements prometheus.Collector.
 type Exporter struct {
-	error        prometheus.Gauge
-	totalScrapes prometheus.Counter
-	scrapeErrors *prometheus.CounterVec
-	lbPluginUp   prometheus.Gauge
+	error              prometheus.Gauge
+	totalScrapes       prometheus.Counter
+	scrapeErrors       *prometheus.CounterVec
+	lbPluginUp         prometheus.Gauge
+	queueMessageNumber *prometheus.GaugeVec
+	mqm                mq.ActionMQ
 }
 
+var healthDesc = prometheus.NewDesc(
+	prometheus.BuildFQName(namespace, exporter, "health_status"),
+	"health status.",
+	[]string{"service_name"}, nil,
+)
+
 //NewExporter new a exporter
-func NewExporter() *Exporter {
+func NewExporter(mqm mq.ActionMQ) *Exporter {
 	return &Exporter{
+		mqm: mqm,
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: exporter,
@@ -71,6 +83,11 @@ func NewExporter() *Exporter {
 			Name:      "up",
 			Help:      "Whether the default lb plugin is up.",
 		}),
+		queueMessageNumber: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "queue_message_number",
+			Help:      "Message queue enqueue total.",
+		}, []string{"topic"}),
 	}
 }
 
@@ -94,12 +111,16 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.scrape(ch)
-
 	ch <- e.totalScrapes
 	ch <- e.error
 	e.scrapeErrors.Collect(ch)
+	for _, topic := range e.mqm.GetAllTopics() {
+		e.queueMessageNumber.WithLabelValues(topic).Set(float64(e.mqm.MessageQueueSize(topic)))
+	}
+	e.queueMessageNumber.Collect(ch)
 }
 
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	e.totalScrapes.Inc()
+	ch <- prometheus.MustNewConstMetric(healthDesc, prometheus.GaugeValue, 1, "mq")
 }
